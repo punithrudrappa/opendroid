@@ -216,11 +216,25 @@ class SettingsViewModel @Inject constructor(
 
     /** Removes only unavailable provider credential records so the user can enter new values. */
     fun resetProviderCredentialsForReentry() {
+        // Cancel pending credential writes before the reset. The header editor debounces
+        // its save by a second, so a job already in flight would otherwise run after the
+        // store was cleared and write the pre-reset block straight back in.
+        apiKeyUpdateJobs.values.forEach(Job::cancel)
+        apiKeyUpdateJobs.clear()
+        elevenLabsApiKeyJob?.cancel()
+        customHeadersJob?.cancel()
+        // Nothing is left to persist, so no in-memory copy may survive either: the
+        // failure path leaves the user with an empty editor rather than a value the
+        // store no longer holds.
+        _customHeaders.value = emptyMap()
+        _llmConfig.value = _llmConfig.value.copy(apiKeys = emptyMap(), elevenLabsApiKey = "")
+
         viewModelScope.launch(Dispatchers.IO) {
             if (settingsRepository.resetProviderCredentialsForReentry() is CredentialStoreResult.Success) {
                 withContext(Dispatchers.Main.immediate) {
                     _huggingFaceToken.value = ""
                     _huggingFaceValidationStatus.value = "Token Required"
+                    _customHeaders.value = emptyMap()
                     _llmConfig.value = _llmConfig.value.copy(
                         apiKeys = emptyMap(),
                         elevenLabsApiKey = ""
