@@ -22,6 +22,7 @@ import javax.inject.Inject
 import com.opendroid.ai.core.llm.ClaudeModelCatalog
 import com.opendroid.ai.core.llm.ConnectionTestPlanner
 import com.opendroid.ai.core.llm.ConnectionTestState
+import com.opendroid.ai.core.llm.CustomHeaderRules
 import com.opendroid.ai.core.llm.ImportLocalModelResult
 import com.opendroid.ai.core.llm.LLMRequest
 import com.opendroid.ai.core.llm.ModelFetchOutcome
@@ -110,6 +111,15 @@ class SettingsViewModel @Inject constructor(
     private var ollamaUrlJob: Job? = null
     private var copilotUrlJob: Job? = null
     private var customEndpointJob: Job? = null
+    private var customHeadersJob: Job? = null
+
+    /**
+     * Header blocks are Keystore-held credentials, so the editor works off its own
+     * in-memory copy instead of the DataStore config: the persisted config never
+     * holds the plaintext a user types here.
+     */
+    private val _customHeaders = MutableStateFlow<Map<String, String>>(emptyMap())
+    val customHeaders: StateFlow<Map<String, String>> = _customHeaders.asStateFlow()
 
     private var isLoaded = false
 
@@ -126,10 +136,18 @@ class SettingsViewModel @Inject constructor(
                 CredentialStoreResult.CredentialsMustBeReentered,
                 CredentialStoreResult.StorageUnavailable -> ""
             }
+            // Header blocks are credentials too, so the editor starts from the
+            // Keystore rather than from anything the DataStore config holds.
+            val headers = when (val stored = providerCredentialStore.readCustomHeaders()) {
+                is CredentialStoreResult.Success -> stored.value
+                CredentialStoreResult.CredentialsMustBeReentered,
+                CredentialStoreResult.StorageUnavailable -> emptyMap()
+            }
             val lastVerified =
                 appSettingsStore.huggingFaceLastVerified() ?: "Never"
             withContext(Dispatchers.Main.immediate) {
                 _huggingFaceToken.value = token
+                _customHeaders.value = headers
                 _huggingFaceLastVerified.value = lastVerified
                 if (token.isNotBlank()) {
                     _huggingFaceValidationStatus.value = "Token Required"
@@ -159,6 +177,7 @@ class SettingsViewModel @Inject constructor(
                     // An already hydrated in-memory snapshot must not become a credential
                     // fallback after direct-store recovery begins.
                     _huggingFaceToken.value = ""
+                    _customHeaders.value = emptyMap()
                     _llmConfig.value = _llmConfig.value.copy(
                         apiKeys = emptyMap(),
                         elevenLabsApiKey = ""
@@ -544,6 +563,42 @@ class SettingsViewModel @Inject constructor(
             }
         }
     }
+
+    /**
+     * Stores the extra HTTP headers for a provider as the user typed them.
+     *
+     * The text is encrypted under the Keystore key, never written to the DataStore
+     * config: a gateway header block routinely carries a token. Only the raw text
+     * survives, so a line the parser rejects stays visible and correctable instead
+     * of being silently discarded.
+     */
+    fun updateCustomHeaders(providerName: String, headers: String) {
+        val updated = _customHeaders.value.toMutableMap()
+        if (headers.isBlank()) updated.remove(providerName) else updated[providerName] = headers
+        _customHeaders.value = updated
+
+        customHeadersJob?.cancel()
+        customHeadersJob = viewModelScope.launch {
+            try {
+                delay(1000)
+                // Read the latest editor text: a slower earlier keystroke must not
+                // overwrite the value the user has already typed past.
+                val latest = _customHeaders.value[providerName].orEmpty()
+                settingsRepository.updateCustomHeaders(providerName, latest)
+            } catch (e: Exception) {
+                if (e !is kotlinx.coroutines.CancellationException) {
+                    android.util.Log.e("SettingsViewModel", "Failed to update custom headers: ${e.message}", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * Why a configured header line is not being sent, for the Settings warning
+     * under the editor. Empty when every line the user typed is in effect.
+     */
+    fun customHeaderWarnings(providerName: String): List<String> =
+        CustomHeaderRules.parse(_customHeaders.value[providerName].orEmpty()).reasons
 
     fun testConnection(providerName: String) {
         connectionTestJob?.cancel()

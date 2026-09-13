@@ -27,6 +27,14 @@ Current release. Sideload the APK for direct install, or use the AAB for Play St
 *   **Granular Folder Selection**: Users can choose specific workspace folders via Android's document tree picker or operate seamlessly within app-scoped sandboxed storage without requiring broad external storage access.
 *   **Permissions UX Enhancements**: Modernized `PermissionsScreen` and `PermissionModel` with folder picking options for Android 11+ (SDK 30+).
 
+#### 🔧 Custom OpenAI Compatible Headers
+*   **User-Defined Request Headers**: The `Custom OpenAI Compatible` provider accepts extra HTTP headers (one `Name: Value` pair per line) that are sent with both chat completions and model-list requests, covering gateways that need routing, attribution, or vendor-auth headers (Portkey, Cloudflare AI Gateway, LiteLLM, corporate proxies).
+*   **Fail-Closed Parsing**: Lines are trimmed, comments (`#`, `;`) and blank lines ignored, duplicate names collapsed to the first value, and malformed names, missing values, overlength values, or embedded line breaks are refused with a per-line reason shown under the editor.
+*   **App-Managed Headers Protected**: `Authorization` (the resolved API key), `Content-Type`, `Content-Length`, `Host`, `Connection`, `Transfer-Encoding`, `Cookie`, and `Accept-Encoding` cannot be replaced from the header block.
+*   **Secret Redaction**: Header values of 8+ characters are registered with `SecretRegistry`, so a gateway token echoed back in a provider error body is redacted exactly like an API key.
+*   **Encrypted At Rest**: Each provider's header block is stored as an AES-256-GCM envelope in `ProviderCredentialStore` under its own Keystore alias and credential-ID authenticated data. `SettingsRepository` commits the encrypted record and strips the `LLMConfig` field in the same transaction, so the plaintext block only ever exists in the header editor; blocks written by earlier builds are migrated into the Keystore on launch.
+*   **Masked Rendering**: Values are bullet-masked in Settings until the user reveals them, while typing and pasting still operate on the real stored text.
+
 #### 🎨 Pure OLED Black & Classic White Theme Redesign
 *   **Clean Contrast Styling**: Overhauled the entire UI theme to pure OLED black (`#000000`) in dark mode and classic pure white (`#FFFFFF`) in light mode.
 *   **Zero Green Accents**: Modernized all buttons, chips, and cards to sleek obsidian/titanium monochrome styling with subtle sky sapphire active badges.

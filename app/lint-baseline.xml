@@ -78,6 +78,19 @@
             column="17"/>
     </issue>
 
+    <!-- Same baselined finding as before, in a file whose line number moved when
+         custom-header support was added to the settings screen's view model. -->
+    <issue
+        id="ObsoleteSdkInt"
+        message="Unnecessary; `SDK_INT` is always >= 26"
+        errorLine1="            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {"
+        errorLine2="                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location
+            file="src/main/java/com/opendroid/ai/ui/viewmodel/SettingsViewModel.kt"
+            line="793"
+            column="13"/>
+    </issue>
+
     <issue
         id="ObsoleteSdkInt"
         message="Unnecessary; `SDK_INT` is always >= 26"

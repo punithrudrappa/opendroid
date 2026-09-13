@@ -33,11 +33,17 @@ class CustomOpenAIProvider @Inject constructor(
     private val mediaType = "application/json; charset=utf-8".toMediaType()
 
     override suspend fun complete(request: LLMRequest): LLMResponse {
-        val config = settingsRepository.llmConfig.first()
+        // Custom headers are a Keystore-held credential, so they arrive through the
+        // request-facing snapshot rather than the UI-facing config read.
+        val config = settingsRepository.llmConfigForProviderRequests.first()
         val apiKey = request.providerConfig?.apiKey?.takeIf { it.isNotBlank() } ?: config.apiKeys[name] ?: ""
         val baseUrl = request.providerConfig?.endpoint?.takeIf { it.isNotBlank() }
             ?.let { UrlUtils.formatBaseUrl(it, "https://api.openai.com/v1") }
             ?: UrlUtils.formatBaseUrl(config.customEndpoints[name] ?: "", "https://api.openai.com/v1")
+        // A wrapped caller resolves these from the same settings snapshot; the
+        // config fallback keeps a direct caller (tests, preview tools) working.
+        val customHeaders = request.providerConfig?.headers?.takeIf { it.isNotEmpty() }
+            ?: CustomHeaderRules.safeTransitions(config.customHeaders[name].orEmpty())
 
         val startTime = System.currentTimeMillis()
         val selectedModel = request.model?.takeIf { it.isNotBlank() } ?: "gpt-4o"
@@ -57,19 +63,24 @@ class CustomOpenAIProvider @Inject constructor(
         }
 
         val bodyJson = gson.toJson(requestBodyMap)
-        val httpRequest = Request.Builder()
+        val requestBuilder = Request.Builder()
             .url("$baseUrl/chat/completions")
             .header("Authorization", "Bearer $apiKey")
             .post(bodyJson.toRequestBody(mediaType))
-            .build()
+        // Applied after the app's own headers, and never able to replace them:
+        // a user line naming Authorization or Content-Type is ignored in parsing.
+        CustomHeaderRules.apply(requestBuilder, customHeaders)
 
         return withContext(Dispatchers.IO) {
-        client.newCall(httpRequest).execute().use { response ->
+        client.newCall(requestBuilder.build()).execute().use { response ->
             if (!response.isSuccessful) {
                 throw response.toSafeProviderException(
                     provider = ProviderErrorDetail.Provider.CUSTOM_OPENAI,
                     request = request,
-                    knownSecrets = listOf(apiKey)
+                    knownSecrets = buildList {
+                        add(apiKey)
+                        addAll(CustomHeaderRules.secretValues(customHeaders))
+                    }
                 )
             }
             val responseBody = response.body.string()

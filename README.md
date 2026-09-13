@@ -232,6 +232,28 @@ In **Settings**, add your API key for any supported provider. OpenDroid works be
 - **Groq** (fastest inference)
 - **Ollama** (fully offline)
 
+#### Custom OpenAI-compatible endpoints
+
+Select **Custom OpenAI Compatible** as the active provider, then set the base URL
+(e.g. `https://api.openai.com/v1`). If the endpoint is a gateway or proxy that needs
+its own routing, attribution, or vendor-auth headers (Portkey, Cloudflare AI
+Gateway, LiteLLM, a corporate proxy), add them under **Custom Headers** — one
+`Name: Value` pair per line:
+
+```
+# routing for the gateway
+X-Portkey-Config: pc-abc123
+CF-Access-Client-Id: 0123.access
+```
+
+Those headers are sent with chat completions *and* with model-list requests, so the
+model picker works against the same gateway. Blank lines and `#`/`;` comments are
+ignored; a line that cannot be sent (malformed name, missing value, or a header the
+app manages itself, such as `Authorization` or `Content-Type`) is reported under the
+editor rather than dropped silently. Values are masked in Settings until you reveal
+them, the block is stored as a Keystore-encrypted credential rather than in the
+app settings file, and header values are redacted out of provider error messages.
+
 ---
 
 ## 🔒 Security

@@ -29,6 +29,18 @@ data class LLMConfig(
     val selectedModels: Map<String, String>? = null,
     val apiKeys: Map<String, String> = emptyMap(), // Provider -> API Key
     val customEndpoints: Map<String, String> = emptyMap(), // Provider -> URL
+    /**
+     * Provider -> extra HTTP headers, in the editor's `Name: Value` line format
+     * (see `CustomHeaderRules`).
+     *
+     * **Migration input only.** Header blocks are credentials and live in
+     * `ProviderCredentialStore` (Keystore-encrypted); `SettingsRepository` writes a
+     * block there and strips this field in the same commit, and hydrates it back
+     * for readers. The field exists so blocks persisted by builds that kept them
+     * here are imported rather than lost, and so a failed import is retried on the
+     * next launch. It is never a source a request path trusts ahead of the store.
+     */
+    val customHeaders: Map<String, String> = emptyMap(),
     // Off by default: LLM-generated plans must be confirmed by the user before
     // executing device actions (calls, messages, settings changes).
     val autoConfirmPlans: Boolean = false,

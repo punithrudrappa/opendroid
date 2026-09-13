@@ -3,6 +3,7 @@ package com.opendroid.ai.core.llm
 import android.util.Log
 import com.opendroid.ai.core.llm.OnDeviceModelRegistry
 import com.opendroid.ai.core.util.UrlUtils
+import com.opendroid.ai.data.models.LLMConfig
 import com.opendroid.ai.data.repository.SettingsRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -57,7 +58,9 @@ class ModelFetcher @Inject constructor(
     private val tag = "ModelFetcher"
 
     suspend fun fetchModels(provider: String): ModelFetchOutcome = withContext(Dispatchers.IO) {
-        val config = settingsRepository.llmConfig.first()
+        // The request-facing snapshot resolves Keystore-held credentials, so a
+        // custom endpoint is listed with the same headers its completions use.
+        val config = settingsRepository.llmConfigForProviderRequests.first()
         val apiKey = config.apiKeys[provider]?.takeIf { it.isNotBlank() }
 
         try {
@@ -161,7 +164,11 @@ class ModelFetcher @Inject constructor(
                         )
                     }
                     val baseUrl = UrlUtils.formatBaseUrl(customUrl, "")
-                    ModelFetchOutcome.Success(openAiStyle(modelsUrl(baseUrl), apiKey, provider))
+                    // A gateway that needs headers to route a completion needs them
+                    // to list models too, or the picker stays empty.
+                    ModelFetchOutcome.Success(
+                        openAiStyle(modelsUrl(baseUrl), apiKey, provider, customHeaders(config, provider))
+                    )
                 }
 
                 ProviderCatalog.ON_DEVICE -> {
@@ -198,13 +205,26 @@ class ModelFetcher @Inject constructor(
     )
 
     /** `/v1/models` is the shape every OpenAI-compatible provider agrees on. */
-    private fun openAiStyle(url: String, apiKey: String?, provider: String): List<AIModel> {
-        val page = getJson(
-            url = url,
-            headers = apiKey?.let { mapOf("Authorization" to "Bearer $it") } ?: emptyMap()
-        )
-        return ModelListParsers.openAiStyle(page, provider)
+    private fun openAiStyle(
+        url: String,
+        apiKey: String?,
+        provider: String,
+        customHeaders: Map<String, String> = emptyMap()
+    ): List<AIModel> {
+        val headers = buildMap {
+            apiKey?.let { put("Authorization", "Bearer $it") }
+            // User headers last: a reserved name (Authorization included) never
+            // reaches here, so this cannot clobber the credential above.
+            putAll(customHeaders)
+        }
+        return ModelListParsers.openAiStyle(getJson(url = url, headers = headers), provider)
     }
+
+    /** The headers this provider's requests carry, resolved for transport. */
+    private fun customHeaders(config: LLMConfig, provider: String): Map<String, String> =
+        CustomHeaderRules.toHeaderMap(
+            CustomHeaderRules.safeTransitions(config.customHeaders[provider].orEmpty())
+        )
 
     private fun modelsUrl(baseUrl: String): String =
         if (baseUrl.endsWith("/v1")) "$baseUrl/models" else "$baseUrl/v1/models"

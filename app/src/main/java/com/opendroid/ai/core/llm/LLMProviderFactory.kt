@@ -76,7 +76,9 @@ class LLMProviderFactory @Inject constructor(
         }
         return WrappedLLMProvider(
             delegate = rawProvider,
-            configProvider = { settingsRepository.llmConfig.first() },
+            // The request-facing snapshot is the one that carries Keystore-held
+            // credentials (API keys, custom-header blocks) into a request.
+            configProvider = { settingsRepository.llmConfigForProviderRequests.first() },
             requestRewriter = ::rewriteRequestIfNeeded
         )
     }
@@ -256,7 +258,11 @@ class WrappedLLMProvider(
 
         return requestRewriter(request).copy(
             model = model,
-            providerConfig = ProviderRequestConfig(apiKey = apiKey, endpoint = endpoint)
+            providerConfig = ProviderRequestConfig(
+                apiKey = apiKey,
+                endpoint = endpoint,
+                headers = CustomHeaderRules.safeTransitions(config.customHeaders[provider].orEmpty())
+            )
         )
     }
 
@@ -312,6 +318,11 @@ class WrappedLLMProvider(
             add(SecretRegistry.register(it))
         }
         request.providerConfig?.endpoint?.takeIf(String::isNotBlank)?.let {
+            add(SecretRegistry.register(it))
+        }
+        // A gateway token lives in a custom header value, so it has to be redacted
+        // out of provider error text exactly like an API key is.
+        CustomHeaderRules.secretValues(request.providerConfig?.headers.orEmpty()).forEach {
             add(SecretRegistry.register(it))
         }
     }

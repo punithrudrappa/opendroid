@@ -55,10 +55,15 @@ interface LLMProvider : AIProvider {
 /**
  * Ephemeral provider configuration captured with a resolved request. It is
  * deliberately excluded from serialization and renders only as redacted text.
+ *
+ * [headers] carries user-supplied extra headers (see `CustomHeaderRules`) for the
+ * providers that accept them; values here can be secrets, which is why this type
+ * has no data-class `toString`.
  */
 class ProviderRequestConfig(
     val apiKey: String,
-    val endpoint: String
+    val endpoint: String,
+    val headers: List<CustomHeaderRules.Transition> = emptyList()
 ) {
     override fun toString(): String = "<redacted provider configuration>"
 }

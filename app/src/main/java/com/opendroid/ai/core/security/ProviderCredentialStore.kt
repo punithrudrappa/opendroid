@@ -53,9 +53,41 @@ sealed class ProviderCredentialId protected constructor(
         legacyPreferenceKey = "huggingface_token"
     )
 
+    /**
+     * The whole `Name: Value` header block a user configured for one provider's
+     * custom endpoint ([providerName] is the canonical provider name).
+     *
+     * The block is stored as one secret rather than a map of names to values:
+     * a gateway header block routinely carries a token, and the blocks are edited
+     * as text. Keeping the raw text also preserves a line the parser rejected, so
+     * it survives a restart and stays correctable instead of vanishing.
+     */
+    class CustomHeaders private constructor(val providerName: String) : ProviderCredentialId(
+        logicalId = "$CUSTOM_HEADERS_LOGICAL_PREFIX$providerName",
+        legacyPreferenceKey = "llm_custom_headers_$providerName"
+    ) {
+        companion object {
+            operator fun invoke(providerName: String): CustomHeaders {
+                require(providerName.isNotBlank()) { "Provider name must not be blank." }
+                require(providerName == providerName.trim()) { "Provider name must not have surrounding whitespace." }
+                require(providerName.length <= MAX_PROVIDER_NAME_LENGTH) { "Provider name is too long." }
+                require(providerName.none { it.code == 0 || it == '\n' || it == '\r' }) {
+                    "Provider name contains an unsupported character."
+                }
+                return CustomHeaders(providerName)
+            }
+        }
+
+        override fun equals(other: Any?): Boolean =
+            other is CustomHeaders && providerName == other.providerName
+
+        override fun hashCode(): Int = providerName.hashCode()
+    }
+
     internal companion object {
         private const val STORAGE_KEY_PREFIX = "credential."
         private const val API_KEY_LOGICAL_PREFIX = "provider-api-key:"
+        private const val CUSTOM_HEADERS_LOGICAL_PREFIX = "provider-custom-headers:"
         private const val MAX_PROVIDER_NAME_LENGTH = 256
 
         fun fromStorageKey(storageKey: String): ProviderCredentialId? {
@@ -76,6 +108,10 @@ sealed class ProviderCredentialId protected constructor(
                 val provider = key.removePrefix("llm_api_key_")
                 runCatching { ApiKey(provider) }.getOrNull()
             }
+            key.startsWith("llm_custom_headers_") -> {
+                val provider = key.removePrefix("llm_custom_headers_")
+                runCatching { CustomHeaders(provider) }.getOrNull()
+            }
             else -> null
         }
 
@@ -84,6 +120,9 @@ sealed class ProviderCredentialId protected constructor(
             logicalId == HuggingFaceToken.logicalId -> HuggingFaceToken
             logicalId.startsWith(API_KEY_LOGICAL_PREFIX) -> runCatching {
                 ApiKey(logicalId.removePrefix(API_KEY_LOGICAL_PREFIX))
+            }.getOrNull()
+            logicalId.startsWith(CUSTOM_HEADERS_LOGICAL_PREFIX) -> runCatching {
+                CustomHeaders(logicalId.removePrefix(CUSTOM_HEADERS_LOGICAL_PREFIX))
             }.getOrNull()
             else -> null
         }
@@ -111,8 +150,9 @@ sealed interface ProviderCredentialRecoveryState {
  * Direct Android-Keystore backed storage for provider credentials.
  *
  * Crypto, envelope format, and the record boundary come from [KeystoreSecretRecords], which is
- * shared with [UserProfileStore]. Its only legacy dependency is a one-time importer for the three
- * provider credential families covered by this API.
+ * shared with [UserProfileStore]. Its only legacy dependency is a one-time importer for the
+ * provider credential families covered by this API: API keys, the ElevenLabs key, the Hugging Face
+ * token, and per-provider custom-header blocks for custom OpenAI-compatible endpoints.
  */
 interface ProviderCredentialStore {
     val recoveryState: StateFlow<ProviderCredentialRecoveryState>
@@ -124,6 +164,25 @@ interface ProviderCredentialStore {
     fun write(credential: ProviderCredentialId, value: String): CredentialStoreResult<Unit>
 
     fun remove(credential: ProviderCredentialId): CredentialStoreResult<Unit>
+
+    /** Provider name -> encrypted custom-header block, for every provider that has one. */
+    fun readCustomHeaders(): CredentialStoreResult<Map<String, String>>
+
+    /**
+     * Commits exactly the providers in [headers] that have a non-blank block and
+     * removes the record for providers in [removeProviders], so a caller can apply
+     * one editor snapshot without knowing which records already existed.
+     *
+     * Every mutation is attempted; the first failure is returned after the writes
+     * that already succeeded, which the caller treats as "nothing was committed".
+     */
+    fun writeCustomHeaders(
+        headers: Map<String, String>,
+        removeProviders: Collection<String>
+    ): CredentialStoreResult<Unit>
+
+    /** Drops every stored header block so the user can enter them again. */
+    fun clearCustomHeaders(): CredentialStoreResult<Unit>
 
     /** Attempts an idempotent, write-before-delete import from legacy preferences. */
     fun migrateLegacyCredentials(): CredentialStoreResult<Unit>
@@ -166,6 +225,16 @@ class AndroidProviderCredentialStore(
 
     override fun remove(credential: ProviderCredentialId): CredentialStoreResult<Unit> =
         delegate.remove(credential)
+
+    override fun readCustomHeaders(): CredentialStoreResult<Map<String, String>> =
+        delegate.readCustomHeaders()
+
+    override fun writeCustomHeaders(
+        headers: Map<String, String>,
+        removeProviders: Collection<String>
+    ): CredentialStoreResult<Unit> = delegate.writeCustomHeaders(headers, removeProviders)
+
+    override fun clearCustomHeaders(): CredentialStoreResult<Unit> = delegate.clearCustomHeaders()
 
     override fun migrateLegacyCredentials(): CredentialStoreResult<Unit> =
         delegate.migrateLegacyCredentials()
@@ -233,6 +302,91 @@ internal class ProviderCredentialStoreImpl(
         // A tombstone is authenticated ciphertext. It prevents a future legacy import from
         // resurrecting a credential the user intentionally removed.
         writeStored(credential, null)
+    }
+
+    override fun readCustomHeaders(): CredentialStoreResult<Map<String, String>> = synchronized(lock) {
+        readCustomHeadersLocked()
+    }
+
+    private fun readCustomHeadersLocked(): CredentialStoreResult<Map<String, String>> {
+        val keys = when (val result = records.keys()) {
+            is SecretRecordResult.Success -> result.value
+            SecretRecordResult.Unrecoverable -> return requireCredentialReentry()
+            SecretRecordResult.StorageUnavailable -> return CredentialStoreResult.StorageUnavailable
+        }
+        val headerBlocks = linkedMapOf<String, String>()
+        for (storageKey in keys) {
+            if (!storageKey.startsWith(STORAGE_KEY_PREFIX)) continue
+            val credential = ProviderCredentialId.fromStorageKey(storageKey)
+                ?: return requireCredentialReentry()
+            if (credential !is ProviderCredentialId.CustomHeaders) continue
+
+            when (val result = readStored(credential)) {
+                is CredentialStoreResult.Success -> result.value.value?.let {
+                    headerBlocks[credential.providerName] = it
+                }
+                CredentialStoreResult.CredentialsMustBeReentered ->
+                    return CredentialStoreResult.CredentialsMustBeReentered
+                CredentialStoreResult.StorageUnavailable ->
+                    return CredentialStoreResult.StorageUnavailable
+            }
+        }
+        return CredentialStoreResult.Success(headerBlocks)
+    }
+
+    override fun writeCustomHeaders(
+        headers: Map<String, String>,
+        removeProviders: Collection<String>
+    ): CredentialStoreResult<Unit> = synchronized(lock) {
+        for ((providerName, block) in headers) {
+            val credential = runCatching { ProviderCredentialId.CustomHeaders(providerName) }.getOrNull()
+                ?: continue
+            if (block.isBlank()) continue
+            when (val result = writeStored(credential, block)) {
+                is CredentialStoreResult.Success -> Unit
+                CredentialStoreResult.CredentialsMustBeReentered ->
+                    return@synchronized CredentialStoreResult.CredentialsMustBeReentered
+                CredentialStoreResult.StorageUnavailable ->
+                    return@synchronized CredentialStoreResult.StorageUnavailable
+            }
+        }
+        for (providerName in removeProviders) {
+            val credential = runCatching { ProviderCredentialId.CustomHeaders(providerName) }.getOrNull()
+                ?: continue
+            // A blank target is the user's decision to clear this provider's headers, so an
+            // existing record is overwritten rather than left behind.
+            when (val result = writeStored(credential, null)) {
+                is CredentialStoreResult.Success -> Unit
+                CredentialStoreResult.CredentialsMustBeReentered ->
+                    return@synchronized CredentialStoreResult.CredentialsMustBeReentered
+                CredentialStoreResult.StorageUnavailable ->
+                    return@synchronized CredentialStoreResult.StorageUnavailable
+            }
+        }
+        CredentialStoreResult.Success(Unit)
+    }
+
+    override fun clearCustomHeaders(): CredentialStoreResult<Unit> = synchronized(lock) {
+        when (val stored = readCustomHeadersLocked()) {
+            is CredentialStoreResult.Success -> {
+                for (providerName in stored.value.keys) {
+                    val credential = runCatching {
+                        ProviderCredentialId.CustomHeaders(providerName)
+                    }.getOrNull() ?: continue
+                    when (val result = writeStored(credential, null)) {
+                        is CredentialStoreResult.Success -> Unit
+                        CredentialStoreResult.CredentialsMustBeReentered ->
+                            return@synchronized CredentialStoreResult.CredentialsMustBeReentered
+                        CredentialStoreResult.StorageUnavailable ->
+                            return@synchronized CredentialStoreResult.StorageUnavailable
+                    }
+                }
+                CredentialStoreResult.Success(Unit)
+            }
+            CredentialStoreResult.CredentialsMustBeReentered ->
+                CredentialStoreResult.CredentialsMustBeReentered
+            CredentialStoreResult.StorageUnavailable -> CredentialStoreResult.StorageUnavailable
+        }
     }
 
     override fun migrateLegacyCredentials(): CredentialStoreResult<Unit> = synchronized(lock) {

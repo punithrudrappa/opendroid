@@ -40,6 +40,7 @@ import com.opendroid.ai.data.models.resolvedAutoMode
 import com.opendroid.ai.core.llm.OnDeviceModelRegistry
 import com.opendroid.ai.core.llm.OnDeviceBackend
 import com.opendroid.ai.core.llm.ConnectionTestState
+import com.opendroid.ai.core.llm.CustomHeaderRules
 import com.opendroid.ai.core.llm.error.LLMError
 import com.opendroid.ai.core.security.ProviderCredentialRecoveryState
 import com.opendroid.ai.data.repository.ProviderCredentialPersistenceState
@@ -81,6 +82,7 @@ fun SettingsScreen(
     modifier: Modifier = Modifier
 ) {
     val config by viewModel.llmConfig.collectAsState()
+    val customHeaders by viewModel.customHeaders.collectAsState()
     val connectionResults by viewModel.connectionResults.collectAsState()
     val dbModels by viewModel.allModels.collectAsState()
     val storageInfo by viewModel.storageInfo.collectAsState()
@@ -1556,6 +1558,12 @@ fun SettingsScreen(
                                 fontSize = 10.sp,
                                 color = TextSecondary
                             )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            CustomHeadersEditor(
+                                value = customHeaders["Custom OpenAI Compatible"] ?: "",
+                                onValueChange = { viewModel.updateCustomHeaders("Custom OpenAI Compatible", it) },
+                                warnings = viewModel.customHeaderWarnings("Custom OpenAI Compatible")
+                            )
                         }
                     }
                 }
@@ -2638,4 +2646,94 @@ private fun SecureApiKeyField(
         ),
         modifier = modifier.fillMaxWidth()
     )
+}
+
+/**
+ * Editor for extra headers sent to a custom OpenAI-compatible endpoint, one
+ * `Name: Value` pair per line.
+ *
+ * Values are masked unless the user opts in to reveal them, because a gateway
+ * header often carries a token. Masking is applied to the rendered text only:
+ * typing and pasting always operate on the real value, so the caret and the
+ * stored string stay correct — the same trade-off `SecureApiKeyField` makes for a
+ * single-line secret, extended to a block of lines.
+ *
+ * [warnings] lists lines that are configured but not sent (a reserved name, a
+ * malformed name, a missing value). They are shown instead of being dropped
+ * silently, so a header that "does nothing" has a visible reason.
+ */
+@Composable
+private fun CustomHeadersEditor(
+    value: String,
+    onValueChange: (String) -> Unit,
+    warnings: List<String>,
+    modifier: Modifier = Modifier
+) {
+    var revealValues by remember { mutableStateOf(false) }
+    val maskedValue = remember(value) { CustomHeaderRules.mask(value) }
+
+    Text(
+        text = "CUSTOM HEADERS (OPTIONAL)",
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Bold,
+        fontFamily = FontFamily.Monospace,
+        color = TextPrimary
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+    OutlinedTextField(
+        value = if (revealValues) value else maskedValue,
+        onValueChange = onValueChange,
+        label = { Text("One header per line", fontSize = 12.sp) },
+        placeholder = {
+            Text(
+                "X-Portkey-Config: pc-abc123\nCF-Access-Client-Id: 0123.access",
+                fontSize = 12.sp,
+                color = TextSecondary
+            )
+        },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+        visualTransformation = VisualTransformation.None,
+        minLines = 3,
+        maxLines = 8,
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = AccentCyan,
+            unfocusedBorderColor = BorderColor,
+            focusedTextColor = TextPrimary,
+            unfocusedTextColor = TextPrimary
+        ),
+        modifier = modifier.fillMaxWidth()
+    )
+    Spacer(modifier = Modifier.height(4.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = "Sent with chat and model-list requests. Authorization, Content-Type and other app-managed headers cannot be replaced.",
+            fontSize = 10.sp,
+            color = TextSecondary,
+            modifier = Modifier.weight(1f)
+        )
+        TextButton(
+            onClick = { revealValues = !revealValues },
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+        ) {
+            Text(
+                text = if (revealValues) "Hide values" else "Show values",
+                fontSize = 11.sp,
+                color = AccentCyan
+            )
+        }
+    }
+    if (warnings.isNotEmpty()) {
+        Spacer(modifier = Modifier.height(4.dp))
+        warnings.forEach { warning ->
+            Text(
+                text = "⚠ $warning",
+                fontSize = 10.sp,
+                color = Color(0xFFFF9800)
+            )
+        }
+    }
 }

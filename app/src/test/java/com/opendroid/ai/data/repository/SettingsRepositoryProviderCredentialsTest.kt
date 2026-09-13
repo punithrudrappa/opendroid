@@ -170,6 +170,113 @@ class SettingsRepositoryProviderCredentialsTest {
         assertTrue(repository.llmConfig.first().apiKeys["OpenAI"] == "old-openai-secret")
     }
 
+    @Test
+    fun `custom headers reach the Keystore and never stay in the DataStore JSON`() = runBlocking {
+        val dataStore = newDataStore()
+        val credentials = InMemoryProviderCredentialStore()
+        val gatewayToken = "gw-token-0123456789abcdef"
+        val block = "X-Gateway-Token: $gatewayToken"
+        val repository = SettingsRepository(dataStore, credentials, runStartupMigration = false)
+
+        repository.updateConfig { it.copy(customHeaders = mapOf(PROVIDER to block)) }
+
+        val persistedJson = dataStore.data.first()[LLM_CONFIG_KEY].orEmpty()
+        assertFalse(persistedJson.contains(gatewayToken))
+        assertTrue(
+            Json.decodeFromString<LLMConfig>(persistedJson).customHeaders.isEmpty()
+        )
+        assertEquals(
+            block,
+            credentials.values[ProviderCredentialId.CustomHeaders(PROVIDER)]
+        )
+        // Readers still see the block, hydrated from the encrypted record.
+        assertEquals(block, repository.llmConfig.first().customHeaders[PROVIDER])
+        assertEquals(
+            block,
+            repository.llmConfigForProviderRequests.first().customHeaders[PROVIDER]
+        )
+    }
+
+    @Test
+    fun `clearing a header block removes the encrypted record rather than leaving it live`() = runBlocking {
+        val dataStore = newDataStore()
+        val credentials = InMemoryProviderCredentialStore()
+        val credential = ProviderCredentialId.CustomHeaders(PROVIDER)
+        val repository = SettingsRepository(dataStore, credentials, runStartupMigration = false)
+        repository.updateConfig { it.copy(customHeaders = mapOf(PROVIDER to "X-Tenant: acme")) }
+
+        repository.updateConfig { it.copy(customHeaders = emptyMap()) }
+
+        assertFalse(credentials.values.containsKey(credential))
+        assertTrue(repository.llmConfig.first().customHeaders.isEmpty())
+    }
+
+    @Test
+    fun `plaintext header blocks from an older build are migrated into the Keystore and stripped`() = runBlocking {
+        val dataStore = newDataStore()
+        val credentials = InMemoryProviderCredentialStore()
+        val gatewayToken = "gw-legacy-token-0123456789"
+        val block = "X-Gateway-Token: $gatewayToken"
+        dataStore.edit { preferences ->
+            preferences[LLM_CONFIG_KEY] = Json.encodeToString(
+                LLMConfig(customHeaders = mapOf(PROVIDER to block))
+            )
+        }
+        val repository = SettingsRepository(dataStore, credentials, runStartupMigration = false)
+
+        assertTrue(repository.updateCustomHeaders(PROVIDER, block) is CredentialStoreResult.Success)
+        repository.updateConfig { it }
+
+        val persistedJson = dataStore.data.first()[LLM_CONFIG_KEY].orEmpty()
+        assertFalse(persistedJson.contains(gatewayToken))
+        assertEquals(block, credentials.values[ProviderCredentialId.CustomHeaders(PROVIDER)])
+    }
+
+    @Test
+    fun `an update that cannot reach the Keystore leaves the plaintext source retryable`() = runBlocking {
+        val dataStore = newDataStore()
+        val credentials = InMemoryProviderCredentialStore(unavailable = true)
+        val block = "X-Tenant: acme"
+        dataStore.edit { preferences ->
+            preferences[LLM_CONFIG_KEY] = Json.encodeToString(
+                LLMConfig(customHeaders = mapOf(PROVIDER to block))
+            )
+        }
+        val repository = SettingsRepository(dataStore, credentials, runStartupMigration = false)
+
+        assertEquals(
+            ProviderCredentialPersistenceState.CredentialsMustBeReentered,
+            repository.updateConfig { it }
+        )
+
+        // Dropping the plaintext here would lose the user's headers for good.
+        val persisted = Json.decodeFromString<LLMConfig>(
+            dataStore.data.first()[LLM_CONFIG_KEY].orEmpty()
+        )
+        assertEquals(block, persisted.customHeaders[PROVIDER])
+        assertTrue(repository.llmConfig.first().customHeaders.isEmpty())
+    }
+
+    @Test
+    fun `a header block pending migration is still used by a provider request`() = runBlocking {
+        val dataStore = newDataStore()
+        val credentials = InMemoryProviderCredentialStore()
+        val block = "X-Tenant: acme"
+        dataStore.edit { preferences ->
+            preferences[LLM_CONFIG_KEY] = Json.encodeToString(
+                LLMConfig(customHeaders = mapOf(PROVIDER to block))
+            )
+        }
+        val repository = SettingsRepository(dataStore, credentials, runStartupMigration = false)
+
+        // The Keystore holds nothing yet, so the not-yet-migrated block is what the
+        // request path has to use rather than silently sending no headers.
+        assertEquals(
+            block,
+            repository.llmConfigForProviderRequests.first().customHeaders[PROVIDER]
+        )
+    }
+
     private fun newDataStore() = PreferenceDataStoreFactory.create(
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined),
         produceFile = {
@@ -205,6 +312,36 @@ class SettingsRepositoryProviderCredentialsTest {
                 values.filterKeys { it is ProviderCredentialId.ApiKey }
                     .mapKeys { (credential, _) -> (credential as ProviderCredentialId.ApiKey).providerName }
             )
+
+        override fun readCustomHeaders(): CredentialStoreResult<Map<String, String>> =
+            unavailableResult() ?: CredentialStoreResult.Success(
+                values.filterKeys { it is ProviderCredentialId.CustomHeaders }
+                    .mapKeys { (credential, _) ->
+                        (credential as ProviderCredentialId.CustomHeaders).providerName
+                    }
+            )
+
+        override fun writeCustomHeaders(
+            headers: Map<String, String>,
+            removeProviders: Collection<String>
+        ): CredentialStoreResult<Unit> {
+            for ((providerName, block) in headers) {
+                if (block.isBlank()) continue
+                val result = write(ProviderCredentialId.CustomHeaders(providerName), block)
+                if (result !is CredentialStoreResult.Success) return result
+            }
+            for (providerName in removeProviders) {
+                val result = remove(ProviderCredentialId.CustomHeaders(providerName))
+                if (result !is CredentialStoreResult.Success) return result
+            }
+            return CredentialStoreResult.Success(Unit)
+        }
+
+        override fun clearCustomHeaders(): CredentialStoreResult<Unit> {
+            values.keys.filterIsInstance<ProviderCredentialId.CustomHeaders>()
+                .forEach { values.remove(it) }
+            return CredentialStoreResult.Success(Unit)
+        }
 
         override fun write(
             credential: ProviderCredentialId,
@@ -249,5 +386,6 @@ class SettingsRepositoryProviderCredentialsTest {
 
     private companion object {
         val LLM_CONFIG_KEY = stringPreferencesKey("llm_config")
+        const val PROVIDER = "Custom OpenAI Compatible"
     }
 }

@@ -215,6 +215,125 @@ class ProviderCredentialStoreTest {
         )
     }
 
+    @Test
+    fun `custom header blocks are stored as ciphertext and enumerated per provider`() {
+        val records = InMemoryCredentialRecords()
+        val store = newStore(records = records)
+        val gatewayToken = "gw-token-0123456789abcdef"
+        val block = "X-Gateway-Token: $gatewayToken\nX-Tenant: acme"
+
+        assertTrue(
+            store.writeCustomHeaders(mapOf("Custom OpenAI Compatible" to block), emptyList())
+                    is CredentialStoreResult.Success
+        )
+
+        val rawRecord = records.records.values.single()
+        assertTrue(rawRecord.startsWith("v1."))
+        assertFalse(rawRecord.contains(gatewayToken))
+        assertFalse(rawRecord.contains("X-Tenant"))
+        assertEquals(
+            mapOf("Custom OpenAI Compatible" to block),
+            (store.readCustomHeaders() as CredentialStoreResult.Success).value
+        )
+    }
+
+    @Test
+    fun `writing an empty header map for a provider removes its stored block`() {
+        val records = InMemoryCredentialRecords()
+        val store = newStore(records = records)
+        store.writeCustomHeaders(mapOf("Custom OpenAI Compatible" to "X-Tenant: acme"), emptyList())
+
+        assertTrue(
+            store.writeCustomHeaders(emptyMap(), listOf("Custom OpenAI Compatible"))
+                    is CredentialStoreResult.Success
+        )
+
+        assertTrue((store.readCustomHeaders() as CredentialStoreResult.Success).value.isEmpty())
+    }
+
+    @Test
+    fun `clearing custom headers leaves api keys untouched`() {
+        val records = InMemoryCredentialRecords()
+        val store = newStore(records = records)
+        val apiKey = ProviderCredentialId.ApiKey("OpenAI")
+        store.write(apiKey, "sk-keep-me")
+        store.writeCustomHeaders(mapOf("Custom OpenAI Compatible" to "X-Tenant: acme"), emptyList())
+
+        assertTrue(store.clearCustomHeaders() is CredentialStoreResult.Success)
+
+        assertTrue((store.readCustomHeaders() as CredentialStoreResult.Success).value.isEmpty())
+        assertEquals("sk-keep-me", (store.read(apiKey) as CredentialStoreResult.Success).value)
+    }
+
+    @Test
+    fun `custom header storage keys do not disturb provider api key enumeration`() {
+        val records = InMemoryCredentialRecords()
+        val store = newStore(records = records)
+        val apiKey = ProviderCredentialId.ApiKey("Custom OpenAI Compatible")
+        store.write(apiKey, "sk-provider-key")
+        store.writeCustomHeaders(
+            mapOf("Custom OpenAI Compatible" to "X-Tenant: acme"),
+            emptyList()
+        )
+
+        assertEquals(
+            mapOf("Custom OpenAI Compatible" to "sk-provider-key"),
+            (store.readProviderApiKeys() as CredentialStoreResult.Success).value
+        )
+    }
+
+    @Test
+    fun `a header block tampered with in storage is rejected rather than returned`() {
+        val records = InMemoryCredentialRecords()
+        val store = newStore(records = records)
+        val credential = ProviderCredentialId.CustomHeaders("Custom OpenAI Compatible")
+        store.writeCustomHeaders(
+            mapOf("Custom OpenAI Compatible" to "X-Tenant: acme"),
+            emptyList()
+        )
+
+        val parts = records.records.getValue(credential.storageKey).split('.')
+        val ciphertext = Base64.getUrlDecoder().decode(parts[2])
+        ciphertext[0] = (ciphertext[0].toInt() xor 0x01).toByte()
+        records.records[credential.storageKey] = "${parts[0]}.${parts[1]}." +
+            Base64.getUrlEncoder().withoutPadding().encodeToString(ciphertext)
+
+        assertEquals(CredentialStoreResult.CredentialsMustBeReentered, store.readCustomHeaders())
+        assertEquals(
+            ProviderCredentialRecoveryState.CredentialsMustBeReentered,
+            store.recoveryState.value
+        )
+    }
+
+    @Test
+    fun `a header block cannot be read under a different provider's identity`() {
+        val records = InMemoryCredentialRecords()
+        val store = newStore(records = records)
+        val customOpenAi = ProviderCredentialId.CustomHeaders("Custom OpenAI Compatible")
+        val otherProvider = ProviderCredentialId.CustomHeaders("Other Endpoint")
+        store.writeCustomHeaders(
+            mapOf("Custom OpenAI Compatible" to "X-Tenant: acme"),
+            emptyList()
+        )
+
+        records.records[otherProvider.storageKey] = records.records.getValue(customOpenAi.storageKey)
+
+        assertEquals(CredentialStoreResult.CredentialsMustBeReentered, store.read(otherProvider))
+    }
+
+    @Test
+    fun `reset for reentry clears header blocks along with the other provider credentials`() {
+        val records = InMemoryCredentialRecords()
+        val store = newStore(records = records)
+        store.write(ProviderCredentialId.ApiKey("OpenAI"), "sk-secret")
+        store.writeCustomHeaders(mapOf("Custom OpenAI Compatible" to "X-Tenant: acme"), emptyList())
+
+        assertTrue(store.resetForReentry() is CredentialStoreResult.Success)
+
+        assertTrue((store.readCustomHeaders() as CredentialStoreResult.Success).value.isEmpty())
+        assertNull((store.read(ProviderCredentialId.ApiKey("OpenAI")) as CredentialStoreResult.Success).value)
+    }
+
     private fun newStore(
         records: InMemoryCredentialRecords = InMemoryCredentialRecords(),
         cipher: TestAeadCipher = TestAeadCipher(),

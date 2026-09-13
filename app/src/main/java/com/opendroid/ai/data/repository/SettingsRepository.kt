@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
@@ -75,6 +76,9 @@ class SettingsRepository internal constructor(
                 try {
                     providerCredentialStore.migrateLegacyCredentials()
                     updateConfig { it }
+                    // Header blocks written by earlier builds sat in the plaintext config;
+                    // this moves them into the Keystore and strips them from the JSON.
+                    migratePlaintextCustomHeaders()
                 } catch (_: Exception) {
                     // The credential store has no plaintext fallback; a later update retries.
                 }
@@ -85,26 +89,73 @@ class SettingsRepository internal constructor(
     /**
      * Reads only authenticated direct-store values. Persisted JSON credentials are migration
      * input, never a runtime credential fallback.
+     *
+     * Custom-header blocks are credentials too, so a reader sees the decrypted block here while
+     * the config the DataStore actually holds keeps its copy empty.
      */
     private fun mergeSecretsForRead(persisted: LLMConfig): LLMConfig {
         val snapshot = (readCredentialSnapshot() as? CredentialSnapshotResult.Success)?.snapshot
-            ?: return persisted.copy(apiKeys = emptyMap(), elevenLabsApiKey = "")
+            ?: return persisted.strippedOfSecrets()
         return persisted.copy(
             apiKeys = snapshot.providerApiKeys,
-            elevenLabsApiKey = snapshot.elevenLabsApiKey.orEmpty()
+            elevenLabsApiKey = snapshot.elevenLabsApiKey.orEmpty(),
+            customHeaders = snapshot.customHeaders
         )
     }
 
     /**
      * Supplies legacy DataStore values to a write only when direct credential reads are healthy.
      * This gives the one-time DataStore migration a source without exposing it to callers.
+     *
+     * A header block the Keystore does not hold yet is carried over from the persisted config, so
+     * an update that cannot reach the credential store leaves the plaintext source retryable
+     * instead of dropping the user's headers.
      */
     private fun mergeSecretsForUpdate(persisted: LLMConfig): LLMConfig {
         val snapshot = (readCredentialSnapshot() as? CredentialSnapshotResult.Success)?.snapshot
-            ?: return persisted.copy(apiKeys = emptyMap(), elevenLabsApiKey = "")
+            ?: return persisted.strippedOfSecrets()
         return persisted.copy(
             apiKeys = persisted.apiKeys + snapshot.providerApiKeys,
-            elevenLabsApiKey = snapshot.elevenLabsApiKey ?: persisted.elevenLabsApiKey
+            elevenLabsApiKey = snapshot.elevenLabsApiKey ?: persisted.elevenLabsApiKey,
+            customHeaders = persisted.customHeaders + snapshot.customHeaders
+        )
+    }
+
+    /** The shape every read/write path uses when the Keystore cannot be trusted. */
+    private fun LLMConfig.strippedOfSecrets(): LLMConfig =
+        copy(apiKeys = emptyMap(), elevenLabsApiKey = "", customHeaders = emptyMap())
+
+    /**
+     * Configuration for an outbound provider request.
+     *
+     * Only the two credential families whose *absence* changes a request's shape are resolved
+     * (API keys and custom-header blocks). Latency benchmarks, model caches, and every other
+     * setting come straight from the DataStore snapshot, so this stays off the main thread.
+     *
+     * A plaintext block still in the DataStore is used only while the Keystore holds none for that
+     * provider. That is the pre-migration state — [migratePlaintextCustomHeaders] writes the
+     * encrypted record before it strips the plaintext, so the two sources never both hold a value
+     * and a request can never silently lose a user's headers.
+     */
+    val llmConfigForProviderRequests: Flow<LLMConfig> = dataStore.data
+        .map { preferences -> hydrateProviderRequestSecrets(decodeConfig(preferences[llmConfigKey])) }
+        .flowOn(Dispatchers.IO)
+
+    private fun hydrateProviderRequestSecrets(persisted: LLMConfig): LLMConfig {
+        val apiKeys = when (val stored = providerCredentialStore.readProviderApiKeys()) {
+            is CredentialStoreResult.Success -> stored.value
+            CredentialStoreResult.CredentialsMustBeReentered,
+            CredentialStoreResult.StorageUnavailable -> emptyMap()
+        }
+        val encryptedHeaders = when (val stored = providerCredentialStore.readCustomHeaders()) {
+            is CredentialStoreResult.Success -> stored.value
+            CredentialStoreResult.CredentialsMustBeReentered,
+            CredentialStoreResult.StorageUnavailable -> emptyMap()
+        }
+        return persisted.copy(
+            apiKeys = apiKeys,
+            customHeaders = persisted.customHeaders + encryptedHeaders,
+            elevenLabsApiKey = ""
         )
     }
 
@@ -158,7 +209,45 @@ class SettingsRepository internal constructor(
             }
         }
 
-        return CredentialStripResult.Success(config.copy(apiKeys = emptyMap(), elevenLabsApiKey = ""))
+        // Custom-header blocks are committed here and stripped from the persisted config, so a
+        // gateway token never stays readable in the DataStore JSON.
+        val stripResult = storeCustomHeadersAndStrip(config, snapshot, attemptedCredentials)
+        if (stripResult != null) return CredentialStripResult.Failure(stripResult)
+
+        return CredentialStripResult.Success(
+            config.copy(apiKeys = emptyMap(), elevenLabsApiKey = "", customHeaders = emptyMap())
+        )
+    }
+
+    /**
+     * Writes every configured header block to the Keystore and returns null on success, or the
+     * state to report when a mutation failed and the snapshot could not be restored.
+     *
+     * Providers whose block was cleared are removed explicitly, so a cleared editor does not leave
+     * the old encrypted record behind as an invisible live credential.
+     */
+    private fun storeCustomHeadersAndStrip(
+        config: LLMConfig,
+        snapshot: CredentialSnapshot,
+        attemptedCredentials: MutableSet<ProviderCredentialId>
+    ): ProviderCredentialPersistenceState? {
+        val desired = linkedMapOf<String, String>()
+        config.customHeaders.forEach { (provider, block) ->
+            val credential = runCatching { ProviderCredentialId.CustomHeaders(provider) }.getOrNull()
+                ?: return@forEach
+            if (block.isNotBlank()) desired[credential.providerName] = block
+        }
+        val removals = snapshot.customHeaders.keys - desired.keys
+        if (desired.isEmpty() && removals.isEmpty()) return null
+
+        attemptedCredentials +=
+            desired.keys.map { ProviderCredentialId.CustomHeaders(it) } +
+                removals.map { ProviderCredentialId.CustomHeaders(it) }
+
+        return when (val result = providerCredentialStore.writeCustomHeaders(desired, removals)) {
+            is CredentialStoreResult.Success -> null
+            else -> restoreSnapshot(snapshot, attemptedCredentials) ?: result.toPersistenceState()
+        }
     }
 
     private fun persistCredential(
@@ -178,6 +267,7 @@ class SettingsRepository internal constructor(
         for (credential in attemptedCredentials) {
             val previousValue = when (credential) {
                 is ProviderCredentialId.ApiKey -> snapshot.providerApiKeys[credential.providerName]
+                is ProviderCredentialId.CustomHeaders -> snapshot.customHeaders[credential.providerName]
                 ProviderCredentialId.ElevenLabsApiKey -> snapshot.elevenLabsApiKey
                 ProviderCredentialId.HuggingFaceToken -> null
             }
@@ -204,8 +294,10 @@ class SettingsRepository internal constructor(
         }
         val providerApiKeys = providerCredentialStore.readProviderApiKeys()
         val elevenLabsApiKey = providerCredentialStore.read(ProviderCredentialId.ElevenLabsApiKey)
+        val customHeaders = providerCredentialStore.readCustomHeaders()
         if (providerApiKeys !is CredentialStoreResult.Success ||
             elevenLabsApiKey !is CredentialStoreResult.Success ||
+            customHeaders !is CredentialStoreResult.Success ||
             providerCredentialStore.recoveryState.value ==
                 ProviderCredentialRecoveryState.CredentialsMustBeReentered
         ) {
@@ -215,13 +307,61 @@ class SettingsRepository internal constructor(
                     ProviderCredentialPersistenceState.CredentialsMustBeReentered
                 providerApiKeys !is CredentialStoreResult.Success ->
                     providerApiKeys.toPersistenceState()
-                else -> elevenLabsApiKey.toPersistenceState()
+                elevenLabsApiKey !is CredentialStoreResult.Success ->
+                    elevenLabsApiKey.toPersistenceState()
+                else -> customHeaders.toPersistenceState()
             }
             return CredentialSnapshotResult.Failure(failure)
         }
         return CredentialSnapshotResult.Success(
-            CredentialSnapshot(providerApiKeys.value, elevenLabsApiKey.value)
+            CredentialSnapshot(providerApiKeys.value, elevenLabsApiKey.value, customHeaders.value)
         )
+    }
+
+    /**
+     * Writes a header block encrypted, for the editor's save path.
+     *
+     * A blank block removes the record, and the DataStore copy stays empty either way — this is
+     * the only way the plaintext the user types reaches persistence, and it reaches it as
+     * ciphertext under a Keystore key.
+     */
+    suspend fun updateCustomHeaders(
+        providerName: String,
+        headers: String
+    ): CredentialStoreResult<Unit> = withContext(Dispatchers.IO) {
+        val credential = runCatching { ProviderCredentialId.CustomHeaders(providerName) }.getOrNull()
+            ?: return@withContext CredentialStoreResult.StorageUnavailable
+        val result = if (headers.isBlank()) {
+            providerCredentialStore.writeCustomHeaders(emptyMap(), listOf(credential.providerName))
+        } else {
+            providerCredentialStore.writeCustomHeaders(
+                mapOf(credential.providerName to headers),
+                emptyList()
+            )
+        }
+        mutableProviderCredentialPersistenceState.value = result.toPersistenceState()
+        result
+    }
+
+    /**
+     * Migrates header blocks written by builds that kept them in the plaintext DataStore config.
+     *
+     * Each block is committed to the Keystore first and the config is stripped only after the
+     * whole batch succeeded, so a storage failure leaves the DataStore as the single retryable
+     * source instead of losing the user's headers.
+     */
+    private suspend fun migratePlaintextCustomHeaders(): CredentialStoreResult<Unit> {
+        val persisted = decodeConfig(dataStore.data.first()[llmConfigKey])
+        val plaintextBlocks = persisted.customHeaders.filterValues { it.isNotBlank() }
+        if (plaintextBlocks.isEmpty()) return CredentialStoreResult.Success(Unit)
+        return when (providerCredentialStore.writeCustomHeaders(plaintextBlocks, emptyList())) {
+            is CredentialStoreResult.Success -> updateConfig { current ->
+                current.copy(customHeaders = current.customHeaders - plaintextBlocks.keys)
+            }.let { CredentialStoreResult.Success(Unit) }
+            CredentialStoreResult.CredentialsMustBeReentered ->
+                CredentialStoreResult.CredentialsMustBeReentered
+            CredentialStoreResult.StorageUnavailable -> CredentialStoreResult.StorageUnavailable
+        }
     }
 
     suspend fun resetProviderCredentialsForReentry(): CredentialStoreResult<Unit> =
@@ -233,7 +373,9 @@ class SettingsRepository internal constructor(
 
     private data class CredentialSnapshot(
         val providerApiKeys: Map<String, String>,
-        val elevenLabsApiKey: String?
+        val elevenLabsApiKey: String?,
+        /** Provider -> encrypted custom-header block. */
+        val customHeaders: Map<String, String>
     )
 
     private sealed interface CredentialSnapshotResult {

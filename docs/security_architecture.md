@@ -63,7 +63,7 @@ re-entry recovery path and never receives a plaintext fallback.
 
 | Storage Scope | Key Store / Master Key | Key Encryption Scheme | Value Encryption Scheme |
 |:---|:---|:---|:---|
-| **Provider credentials** | Android KeyStore (`AES`, 256-bit, encrypt/decrypt only) | N/A | `AES/GCM/NoPadding`, random 96-bit IV, credential-ID AAD, versioned envelope |
+| **Provider credentials** (API keys, ElevenLabs key, Hugging Face token, custom-endpoint header blocks) | Android KeyStore (`AES`, 256-bit, encrypt/decrypt only) | N/A | `AES/GCM/NoPadding`, random 96-bit IV, credential-ID AAD, versioned envelope |
 | **User profile (name, DOB)** | Android KeyStore (`AES`, 256-bit, encrypt/decrypt only, separate alias) | N/A | `AES/GCM/NoPadding`, random 96-bit IV, `user-profile` AAD, versioned envelope |
 | **Non-secret app settings** | None (no personal or credential data) | N/A | App-private storage, excluded from backup and device transfer |
 | **Room Database (SQLite)** | App Sandboxed Storage (`opendroid_database`) | System Scoped Permissions | System Scoped Permissions |
@@ -78,6 +78,9 @@ Both direct-Keystore stores strictly enforce a **Zero Plaintext Fallback** polic
 
 - The app-private files hold only versioned AES-GCM envelopes; plaintext credentials are not
   written to the DataStore JSON, and profile details are never written to an unencrypted file.
+  This includes the custom HTTP headers configured for a custom OpenAI-compatible endpoint:
+  `SettingsRepository` commits each provider's header block to `ProviderCredentialStore` and
+  strips the config field in the same transaction, so a gateway token is never the JSON copy.
 - Every envelope is bound to its logical value using GCM AAD - the credential ID for credentials,
   `user-profile` for the profile record. Malformed envelopes, unknown versions, authentication
   failures, and unavailable Keystore keys surface a `CredentialsMustBeReentered` or
@@ -93,7 +96,12 @@ During application startup, `LegacyPreferenceMigration.run()` imports the non-pr
 `user_name` and `user_dob` into `UserProfileStore`, `onboarding_completed` and
 `huggingface_last_verified` into `AppSettingsStore` - and deletes the obsolete `migration_done`
 bookkeeping key. Separately, `ProviderCredentialStore.migrateLegacyCredentials()` imports only
-`llm_api_key_*`, `elevenlabs_api_key`, and `huggingface_token`.
+`llm_api_key_*`, `elevenlabs_api_key`, `huggingface_token`, and `llm_custom_headers_*`.
+
+`SettingsRepository` additionally migrates custom-header blocks written by builds that kept them in
+the plaintext DataStore config: each block is committed as a Keystore envelope first, and the config
+field is stripped only after the whole batch succeeded, so a storage failure leaves the DataStore as
+the single retryable source instead of losing the user's headers.
 
 Both read the plaintext `opendroid_prefs` file. Every import durably commits the destination
 envelope **before** removing the legacy value, so retries are idempotent, a crash in between leaves

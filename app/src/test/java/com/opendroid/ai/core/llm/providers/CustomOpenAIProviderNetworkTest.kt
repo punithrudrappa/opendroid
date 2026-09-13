@@ -137,6 +137,66 @@ class CustomOpenAIProviderNetworkTest {
         assertFalse(failure.message.orEmpty().contains(filler))
     }
 
+    @Test
+    fun `user-supplied headers reach the gateway and reserved names do not`() = runBlocking {
+        val gatewayToken = "gw-token-0123456789abcdef"
+        val provider = providerWithHeaders(
+            """
+            # routing for the gateway
+            X-Portkey-Config: pc-abc123
+            X-Gateway-Token: $gatewayToken
+            Authorization: Bearer attacker-supplied
+            """.trimIndent()
+        )
+        server.enqueue(chatCompletion("pong"))
+
+        provider.complete(newRequest())
+
+        val recorded = server.takeRequest()
+        assertEquals("pc-abc123", recorded.headers["X-Portkey-Config"])
+        assertEquals(gatewayToken, recorded.headers["X-Gateway-Token"])
+        // The app's own credential is not replaceable from the header block.
+        assertEquals("Bearer $apiKey", recorded.headers["Authorization"])
+    }
+
+    @Test
+    fun `a gateway token echoed into an error body is redacted out of the failure`() = runBlocking {
+        val gatewayToken = "gw-token-0123456789abcdef"
+        val provider = providerWithHeaders("X-Gateway-Token: $gatewayToken")
+        server.enqueue(
+            MockResponse.Builder()
+                .code(403)
+                .setHeader("Content-Type", "application/json")
+                .body("""{"error":{"type":"forbidden","code":"$gatewayToken"}}""")
+                .build()
+        )
+
+        val failure = assertThrows(LLMException::class.java) {
+            runBlocking { provider.complete(newRequest()) }
+        }
+
+        assertEquals(403, failure.status)
+        val rendered = "${failure.message} ${failure.detail} ${failure.error.code}"
+        assertFalse(rendered.contains(gatewayToken))
+    }
+
+    @Test
+    fun `no header block means no extra headers`() = runBlocking {
+        server.enqueue(chatCompletion("pong"))
+
+        provider.complete(newRequest())
+
+        val recorded = server.takeRequest()
+        assertEquals("Bearer $apiKey", recorded.headers["Authorization"])
+        assertNull(recorded.headers["X-Gateway-Token"])
+    }
+
+    private fun chatCompletion(content: String) = MockResponse.Builder()
+        .code(200)
+        .setHeader("Content-Type", "application/json")
+        .body("""{"choices": [{"message": {"content": "$content"}}]}""")
+        .build()
+
     private fun newRequest() = LLMRequest(
         systemPrompt = "you are a test",
         messages = listOf(ChatMessage("1", prompt, ChatMessage.Sender.USER)),
@@ -146,6 +206,20 @@ class CustomOpenAIProviderNetworkTest {
             endpoint = server.url("/v1").toString()
         )
     )
+
+    /** A provider whose stored settings name the mock server and carry [headers]. */
+    private suspend fun providerWithHeaders(headers: String): CustomOpenAIProvider {
+        val repository = newSettingsRepository()
+        repository.updateConfig { config ->
+            config.copy(
+                customEndpoints = config.customEndpoints + (PROVIDER to server.url("/v1").toString())
+            )
+        }
+        // Header blocks are Keystore-held credentials, so this is the same call the
+        // Settings editor makes rather than a plaintext config write.
+        repository.updateCustomHeaders(PROVIDER, headers)
+        return CustomOpenAIProvider(AppModule.provideOkHttpClient(), repository)
+    }
 
     private fun newSettingsRepository() = SettingsRepository(
         dataStore = PreferenceDataStoreFactory.create(
@@ -160,10 +234,17 @@ class CustomOpenAIProviderNetworkTest {
         runStartupMigration = false
     )
 
-    /** The request under test carries its own credential, so nothing is stored. */
+    private companion object {
+        const val PROVIDER = "Custom OpenAI Compatible"
+    }
+
+    /** The request under test carries its own credential, so only headers are stored. */
     private class EmptyProviderCredentialStore : ProviderCredentialStore {
         override val recoveryState: StateFlow<ProviderCredentialRecoveryState> =
             MutableStateFlow(ProviderCredentialRecoveryState.Ready)
+
+        /** Stands in for the Keystore record the header editor writes through. */
+        val customHeaders = mutableMapOf<String, String>()
 
         override fun read(credential: ProviderCredentialId): CredentialStoreResult<String?> =
             CredentialStoreResult.Success(null)
@@ -176,6 +257,25 @@ class CustomOpenAIProviderNetworkTest {
 
         override fun remove(credential: ProviderCredentialId): CredentialStoreResult<Unit> =
             CredentialStoreResult.Success(Unit)
+
+        override fun readCustomHeaders(): CredentialStoreResult<Map<String, String>> =
+            CredentialStoreResult.Success(customHeaders.toMap())
+
+        override fun writeCustomHeaders(
+            headers: Map<String, String>,
+            removeProviders: Collection<String>
+        ): CredentialStoreResult<Unit> {
+            headers.filterValues { it.isNotBlank() }.forEach { (provider, block) ->
+                customHeaders[provider] = block
+            }
+            removeProviders.forEach(customHeaders::remove)
+            return CredentialStoreResult.Success(Unit)
+        }
+
+        override fun clearCustomHeaders(): CredentialStoreResult<Unit> {
+            customHeaders.clear()
+            return CredentialStoreResult.Success(Unit)
+        }
 
         override fun migrateLegacyCredentials(): CredentialStoreResult<Unit> =
             CredentialStoreResult.Success(Unit)
