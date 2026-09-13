@@ -40,6 +40,7 @@ import com.opendroid.ai.data.models.resolvedAutoMode
 import com.opendroid.ai.core.llm.OnDeviceModelRegistry
 import com.opendroid.ai.core.llm.OnDeviceBackend
 import com.opendroid.ai.core.llm.ConnectionTestState
+import com.opendroid.ai.core.util.UrlUtils
 import com.opendroid.ai.core.llm.error.LLMError
 import com.opendroid.ai.ui.components.HeaderValuesVisualTransformation
 import com.opendroid.ai.core.security.ProviderCredentialRecoveryState
@@ -1558,6 +1559,19 @@ fun SettingsScreen(
                                 fontSize = 10.sp,
                                 color = TextSecondary
                             )
+                            // Cleartext to a LAN host is intended (self-hosted gateways), but the
+                            // request carries both the API key and any custom header value, so the
+                            // exposure is stated rather than left silent. Remote HTTP cannot be
+                            // reached at all: the app's network security config permits cleartext
+                            // only for localhost/127.0.0.1/10.0.2.2.
+                            if (isCleartextEndpoint(config.customEndpoints["Custom OpenAI Compatible"])) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    text = "⚠ Not an https:// endpoint: the API key and any header values are sent unencrypted over this connection. Use https:// outside a trusted local network.",
+                                    fontSize = 10.sp,
+                                    color = Color(0xFFFF9800)
+                                )
+                            }
                             Spacer(modifier = Modifier.height(16.dp))
                             CustomHeadersEditor(
                                 value = customHeaders["Custom OpenAI Compatible"] ?: "",
@@ -2602,6 +2616,16 @@ private fun connectionStatusLabel(state: ConnectionTestState?): String = when (s
     else -> "Not tested"
 }
 
+/**
+ * True when the configured custom endpoint would send credentials unencrypted.
+ *
+ * Delegates to [UrlUtils] so the rule matches the URL the provider actually builds —
+ * notably, a scheme-less host is `http://` there, not `https://`.
+ */
+private fun isCleartextEndpoint(endpoint: String?): Boolean =
+    UrlUtils.usesCleartextTransport(endpoint)
+
+@Composable
 private fun formatBytes(bytes: Long): String {
     if (bytes <= 0) return "0 B"
     val units = arrayOf("B", "KB", "MB", "GB", "TB")

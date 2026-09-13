@@ -216,30 +216,31 @@ class SettingsViewModel @Inject constructor(
 
     /** Removes only unavailable provider credential records so the user can enter new values. */
     fun resetProviderCredentialsForReentry() {
-        // Cancel pending credential writes before the reset. The header editor debounces
-        // its save by a second, so a job already in flight would otherwise run after the
-        // store was cleared and write the pre-reset block straight back in.
-        apiKeyUpdateJobs.values.forEach(Job::cancel)
-        apiKeyUpdateJobs.clear()
-        elevenLabsApiKeyJob?.cancel()
-        customHeadersJob?.cancel()
-        // Nothing is left to persist, so no in-memory copy may survive either: the
-        // failure path leaves the user with an empty editor rather than a value the
-        // store no longer holds.
-        _customHeaders.value = emptyMap()
-        _llmConfig.value = _llmConfig.value.copy(apiKeys = emptyMap(), elevenLabsApiKey = "")
+        viewModelScope.launch {
+            // Cancel *and await* every pending credential write before clearing anything.
+            // `cancel()` alone is not enough: a job that has already passed its delay is
+            // inside SettingsRepository's synchronous credential write, where cancellation
+            // no longer applies. Joining guarantees that write has finished — so it is
+            // ordered before the reset — instead of racing it for the store lock.
+            val pendingWrites = apiKeyUpdateJobs.values.toList() +
+                listOfNotNull(customHeadersJob, elevenLabsApiKeyJob)
+            apiKeyUpdateJobs.clear()
+            pendingWrites.forEach(Job::cancel)
+            pendingWrites.forEach { runCatching { it.join() } }
 
-        viewModelScope.launch(Dispatchers.IO) {
+            // Nothing is left to persist, so no in-memory copy may survive either: an
+            // empty editor is better than one showing a value the store no longer holds.
+            _customHeaders.value = emptyMap()
+            _llmConfig.value = _llmConfig.value.copy(apiKeys = emptyMap(), elevenLabsApiKey = "")
+
             if (settingsRepository.resetProviderCredentialsForReentry() is CredentialStoreResult.Success) {
-                withContext(Dispatchers.Main.immediate) {
-                    _huggingFaceToken.value = ""
-                    _huggingFaceValidationStatus.value = "Token Required"
-                    _customHeaders.value = emptyMap()
-                    _llmConfig.value = _llmConfig.value.copy(
-                        apiKeys = emptyMap(),
-                        elevenLabsApiKey = ""
-                    )
-                }
+                _huggingFaceToken.value = ""
+                _huggingFaceValidationStatus.value = "Token Required"
+                _customHeaders.value = emptyMap()
+                _llmConfig.value = _llmConfig.value.copy(
+                    apiKeys = emptyMap(),
+                    elevenLabsApiKey = ""
+                )
             }
         }
     }

@@ -79,8 +79,13 @@ Both direct-Keystore stores strictly enforce a **Zero Plaintext Fallback** polic
 - The app-private files hold only versioned AES-GCM envelopes; plaintext credentials are not
   written to the DataStore JSON, and profile details are never written to an unencrypted file.
   This includes the custom HTTP headers configured for a custom OpenAI-compatible endpoint:
-  `SettingsRepository` commits each provider's header block to `ProviderCredentialStore` and
-  strips the config field in the same transaction, so a gateway token is never the JSON copy.
+  `SettingsRepository` writes each provider's header block to `ProviderCredentialStore` first and
+  only then commits the config with that field stripped, so the app never persists a gateway token
+  as JSON. The two stores are **ordered, not transactional**: rollback is best-effort and in-process
+  (`restoreSnapshot` runs only when a credential-store mutation fails), and a process stop between
+  the two writes can leave both copies on disk. Reads resolve that by trusting the encrypted record
+  and ignoring the persisted copy, so the plaintext remnant is inert; a DataStore commit failure
+  surfaces as `StorageUnavailable` and the next successful write strips it.
 - Every envelope is bound to its logical value using GCM AAD - the credential ID for credentials,
   `user-profile` for the profile record. Malformed envelopes, unknown versions, authentication
   failures, and unavailable Keystore keys surface a `CredentialsMustBeReentered` or

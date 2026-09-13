@@ -21,7 +21,9 @@ import kotlinx.coroutines.runBlocking
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import org.junit.After
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -71,14 +73,18 @@ class CustomOpenAIProviderRedirectTest {
         // through a different origin.
         runCatching { runBlocking { provider.complete(newRequest()) } }
 
+        // A regression that stops the initial request must fail this test, not hang it:
+        // both takeRequest calls are bounded.
+        val originRequest = origin.takeRequest(5, TimeUnit.SECONDS)
+        assertNotNull("the origin must receive the request", originRequest)
         assertEquals(
             "the origin must carry the header",
             gatewayToken,
-            origin.takeRequest().headers["X-Gateway-Token"]
+            originRequest!!.headers["X-Gateway-Token"]
         )
         assertNull(
             "no request may reach the redirect target",
-            other.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)
+            other.takeRequest(1, TimeUnit.SECONDS)
         )
     }
 

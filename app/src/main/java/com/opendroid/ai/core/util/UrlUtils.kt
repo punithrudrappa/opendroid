@@ -23,6 +23,22 @@ object UrlUtils {
         return normalize(fallback)
     }
 
+    /**
+     * True when [rawUrl] would be contacted over an unencrypted connection.
+     *
+     * Scheme-less input counts, because [formatBaseUrl] is what actually builds the request
+     * URL and it defaults a missing scheme to `http://` — so `192.168.1.5:8080/v1` really does
+     * travel in cleartext. A blank endpoint, and any `https://` endpoint, do not.
+     *
+     * Callers use this to warn before sending credentials (an API key, or a custom-header
+     * value) over such a connection.
+     */
+    fun usesCleartextTransport(rawUrl: String?): Boolean {
+        val trimmed = rawUrl?.trim().orEmpty()
+        if (trimmed.isEmpty()) return false
+        return !trimmed.startsWith("https://", ignoreCase = true)
+    }
+
     private fun normalize(url: String?): String {
         var trimmed = url?.trim().orEmpty()
         if (trimmed.isEmpty()) return ""
