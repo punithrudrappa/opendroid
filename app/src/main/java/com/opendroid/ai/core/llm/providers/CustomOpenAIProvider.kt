@@ -72,7 +72,7 @@ class CustomOpenAIProvider @Inject constructor(
         CustomHeaderRules.apply(requestBuilder, customHeaders)
 
         return withContext(Dispatchers.IO) {
-        client.newCall(requestBuilder.build()).execute().use { response ->
+        client.noRedirectClient().newCall(requestBuilder.build()).execute().use { response ->
             if (!response.isSuccessful) {
                 throw response.toSafeProviderException(
                     provider = ProviderErrorDetail.Provider.CUSTOM_OPENAI,
@@ -119,5 +119,22 @@ class CustomOpenAIProvider @Inject constructor(
         // Available if the user configured it, or fallback checks pass
         return true
     }
+
+    /**
+     * The shared client follows redirects, which is unsafe for these requests: OkHttp
+     * drops `Authorization` when a redirect crosses origins, but it forwards
+     * arbitrary custom headers, so a gateway token would be sent to whatever host a
+     * redirect names. Measured, not assumed — see `CustomOpenAIProviderNetworkTest`
+     * and `RedirectHeaderForwardingProbeTest`.
+     *
+     * Disabling redirects per call leaves the shared client (and every other
+     * provider's behaviour) untouched. A redirecting custom endpoint now fails
+     * visibly with the redirect status instead of silently forwarding credentials.
+     */
+    private fun OkHttpClient.noRedirectClient(): OkHttpClient =
+        newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
 
 }

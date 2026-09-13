@@ -132,10 +132,17 @@ class SettingsRepository internal constructor(
      * (API keys and custom-header blocks). Latency benchmarks, model caches, and every other
      * setting come straight from the DataStore snapshot, so this stays off the main thread.
      *
-     * A plaintext block still in the DataStore is used only while the Keystore holds none for that
-     * provider. That is the pre-migration state — [migratePlaintextCustomHeaders] writes the
-     * encrypted record before it strips the plaintext, so the two sources never both hold a value
-     * and a request can never silently lose a user's headers.
+     * A plaintext block still in the DataStore is used only while a *successful*
+     * Keystore read reports no record for that provider. That is the pre-migration
+     * state — [migratePlaintextCustomHeaders] writes the encrypted record before it
+     * strips the plaintext, so the two sources never both hold a value and a request
+     * never silently loses a user's headers.
+     *
+     * A failed read is different, and must not fall back: `CredentialsMustBeReentered`
+     * (tampered or unreadable ciphertext) or an unavailable store means the Keystore
+     * cannot be trusted, and the same Zero Plaintext Fallback rule the API keys follow
+     * applies — the request goes out without those headers rather than with a stale
+     * plaintext copy the app can no longer vouch for.
      */
     val llmConfigForProviderRequests: Flow<LLMConfig> = dataStore.data
         .map { preferences -> hydrateProviderRequestSecrets(decodeConfig(preferences[llmConfigKey])) }
@@ -147,14 +154,17 @@ class SettingsRepository internal constructor(
             CredentialStoreResult.CredentialsMustBeReentered,
             CredentialStoreResult.StorageUnavailable -> emptyMap()
         }
-        val encryptedHeaders = when (val stored = providerCredentialStore.readCustomHeaders()) {
-            is CredentialStoreResult.Success -> stored.value
+        val headers = when (val stored = providerCredentialStore.readCustomHeaders()) {
+            // The Keystore answered, so a persisted block it does not hold is the
+            // pre-migration state; an encrypted record wins any collision.
+            is CredentialStoreResult.Success -> persisted.customHeaders + stored.value
+            // The Keystore could not be trusted, so there is no fallback to offer.
             CredentialStoreResult.CredentialsMustBeReentered,
             CredentialStoreResult.StorageUnavailable -> emptyMap()
         }
         return persisted.copy(
             apiKeys = apiKeys,
-            customHeaders = persisted.customHeaders + encryptedHeaders,
+            customHeaders = headers,
             elevenLabsApiKey = ""
         )
     }
@@ -355,9 +365,22 @@ class SettingsRepository internal constructor(
         val plaintextBlocks = persisted.customHeaders.filterValues { it.isNotBlank() }
         if (plaintextBlocks.isEmpty()) return CredentialStoreResult.Success(Unit)
         return when (providerCredentialStore.writeCustomHeaders(plaintextBlocks, emptyList())) {
-            is CredentialStoreResult.Success -> updateConfig { current ->
-                current.copy(customHeaders = current.customHeaders - plaintextBlocks.keys)
-            }.let { CredentialStoreResult.Success(Unit) }
+            // The strip is a config write, not a credential write: the blocks in it
+            // are supplied by the caller, and the encrypted records for those same
+            // providers are already in the snapshot, so they are not mistaken for
+            // deletions. A strip that cannot be persisted is reported rather than
+            // swallowed, so the retry is visible instead of silent.
+            is CredentialStoreResult.Success -> when (
+                val stripped = updateConfig { current ->
+                    current.copy(customHeaders = current.customHeaders - plaintextBlocks.keys)
+                }
+            ) {
+                ProviderCredentialPersistenceState.Ready -> CredentialStoreResult.Success(Unit)
+                ProviderCredentialPersistenceState.StorageUnavailable ->
+                    CredentialStoreResult.StorageUnavailable
+                ProviderCredentialPersistenceState.CredentialsMustBeReentered ->
+                    CredentialStoreResult.CredentialsMustBeReentered
+            }
             CredentialStoreResult.CredentialsMustBeReentered ->
                 CredentialStoreResult.CredentialsMustBeReentered
             CredentialStoreResult.StorageUnavailable -> CredentialStoreResult.StorageUnavailable

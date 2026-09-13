@@ -15,7 +15,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
@@ -212,6 +214,47 @@ class SettingsRepositoryProviderCredentialsTest {
     }
 
     @Test
+    fun `startup migration keeps the encrypted record it just wrote`() = runBlocking {
+        // The migration path goes through updateConfig, whose lambda receives
+        // mergeSecretsForUpdate(config): that value already contains the encrypted
+        // records written moments earlier. Stripping the plaintext keys from it must
+        // not be mistaken for "the user cleared these headers", which would tombstone
+        // the records the migration just created and lose the block for good.
+        val dataStore = newDataStore()
+        val credentials = InMemoryProviderCredentialStore()
+        val block = "X-Gateway-Token: gw-migration-token-0123456789"
+        dataStore.edit { preferences ->
+            preferences[LLM_CONFIG_KEY] = Json.encodeToString(
+                LLMConfig(customHeaders = mapOf(PROVIDER to block))
+            )
+        }
+
+        val repository = SettingsRepository(dataStore, credentials, runStartupMigration = true)
+
+        // The migration runs on its own coroutine; wait for it to finish rather than
+        // asserting on a race.
+        withTimeout(5_000) {
+            while (Json.decodeFromString<LLMConfig>(
+                    dataStore.data.first()[LLM_CONFIG_KEY].orEmpty()
+                ).customHeaders.isNotEmpty()
+            ) {
+                delay(20)
+            }
+        }
+
+        assertEquals(
+            "the migration must leave the encrypted record in place",
+            block,
+            credentials.values[ProviderCredentialId.CustomHeaders(PROVIDER)]
+        )
+        assertFalse(
+            "the plaintext copy must be stripped from the DataStore JSON",
+            dataStore.data.first()[LLM_CONFIG_KEY].orEmpty().contains("gw-migration-token")
+        )
+        assertEquals(block, repository.llmConfig.first().customHeaders[PROVIDER])
+    }
+
+    @Test
     fun `plaintext header blocks from an older build are migrated into the Keystore and stripped`() = runBlocking {
         val dataStore = newDataStore()
         val credentials = InMemoryProviderCredentialStore()
@@ -275,6 +318,33 @@ class SettingsRepositoryProviderCredentialsTest {
             block,
             repository.llmConfigForProviderRequests.first().customHeaders[PROVIDER]
         )
+    }
+
+    @Test
+    fun `a failed credential read does not fall back to the persisted header copy`() = runBlocking {
+        // Zero Plaintext Fallback applies to headers exactly as it does to API keys: when
+        // the Keystore cannot be read, a persisted plaintext block must not be used in its
+        // place, or an unreadable record would silently downgrade to the stale copy
+        // instead of surfacing recovery.
+        //
+        // Note the distinction the fake makes explicit: an unavailable *store* fails the
+        // read. A store that merely reports re-entry-required still answers reads (with an
+        // empty map), and in that case a persisted block genuinely is pre-migration state.
+        val dataStore = newDataStore()
+        val block = "X-Gateway-Token: gw-should-not-be-sent"
+        dataStore.edit { preferences ->
+            preferences[LLM_CONFIG_KEY] = Json.encodeToString(
+                LLMConfig(customHeaders = mapOf(PROVIDER to block))
+            )
+        }
+        val credentials = InMemoryProviderCredentialStore(unavailable = true)
+        val repository = SettingsRepository(dataStore, credentials, runStartupMigration = false)
+
+        assertTrue(
+            "no header may reach a request while the credential store is unreadable",
+            repository.llmConfigForProviderRequests.first().customHeaders.isEmpty()
+        )
+        assertTrue(repository.llmConfig.first().customHeaders.isEmpty())
     }
 
     private fun newDataStore() = PreferenceDataStoreFactory.create(

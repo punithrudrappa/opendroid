@@ -363,6 +363,37 @@ class CustomHeaderRulesTest {
     }
 
     @Test
+    fun `a value with a character OkHttp cannot transport is refused before the wire`() {
+        // OkHttp's checkValue allows only \t and printable ASCII, and throws
+        // IllegalArgumentException while the request is being *built*, which reached the
+        // user as an opaque failure. Each of these is now refused with a reason.
+        val unsendable = mapOf(
+            "control character" to "acme\u0001",
+            "DEL" to "acme\u007f",
+            "non-ASCII" to "acme\u00e9",
+            "em dash" to "acme\u2014",
+            "smart quote" to "acme\u2019"
+        )
+
+        unsendable.forEach { (label, value) ->
+            val parsed = CustomHeaderRules.parse("X-Tenant: $value")
+            assertTrue("$label must be refused", parsed.safe.isEmpty())
+            assertTrue(
+                "$label reason was: ${parsed.reasons.single()}",
+                parsed.reasons.single().contains("cannot send")
+            )
+            assertTrue(CustomHeaderRules.toHeaderMap(parsed.ignored).isEmpty())
+        }
+    }
+
+    @Test
+    fun `tab and the printable ASCII range are transportable`() {
+        val parsed = CustomHeaderRules.parse("X-Tenant: ac me\tand\tmore !~")
+
+        assertEquals("ac me\tand\tmore !~", parsed.safe.single().value)
+    }
+
+    @Test
     fun `the masking guard is reported for every line that carries a bullet`() {
         val parsed = CustomHeaderRules.parse(
             """

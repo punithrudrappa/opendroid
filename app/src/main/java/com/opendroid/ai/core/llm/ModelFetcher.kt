@@ -165,9 +165,16 @@ class ModelFetcher @Inject constructor(
                     }
                     val baseUrl = UrlUtils.formatBaseUrl(customUrl, "")
                     // A gateway that needs headers to route a completion needs them
-                    // to list models too, or the picker stays empty.
+                    // to list models too, or the picker stays empty. Redirects are
+                    // refused here because those headers can carry a gateway token.
                     ModelFetchOutcome.Success(
-                        openAiStyle(modelsUrl(baseUrl), apiKey, provider, customHeaders(config, provider))
+                        openAiStyle(
+                            url = modelsUrl(baseUrl),
+                            apiKey = apiKey,
+                            provider = provider,
+                            customHeaders = customHeaders(config, provider),
+                            followRedirects = false
+                        )
                     )
                 }
 
@@ -209,7 +216,8 @@ class ModelFetcher @Inject constructor(
         url: String,
         apiKey: String?,
         provider: String,
-        customHeaders: Map<String, String> = emptyMap()
+        customHeaders: Map<String, String> = emptyMap(),
+        followRedirects: Boolean = true
     ): List<AIModel> {
         val headers = buildMap {
             apiKey?.let { put("Authorization", "Bearer $it") }
@@ -217,7 +225,10 @@ class ModelFetcher @Inject constructor(
             // reaches here, so this cannot clobber the credential above.
             putAll(customHeaders)
         }
-        return ModelListParsers.openAiStyle(getJson(url = url, headers = headers), provider)
+        return ModelListParsers.openAiStyle(
+            getJson(url = url, headers = headers, followRedirects = followRedirects),
+            provider
+        )
     }
 
     /** The headers this provider's requests carry, resolved for transport. */
@@ -258,11 +269,25 @@ class ModelFetcher @Inject constructor(
      * Neither the URL (it can carry the API key as a query parameter) nor the
      * response body may appear in a thrown message: these are logged and shown
      * to the user.
+     *
+     * [followRedirects] is false for the custom-endpoint branch. Its requests carry
+     * user-supplied credentials in custom headers, and although OkHttp drops
+     * `Authorization` across origins it forwards arbitrary headers, so a redirect
+     * would hand a gateway token to another host. Verified by measurement.
      */
-    private fun getJson(url: String, headers: Map<String, String>): JSONObject {
+    private fun getJson(
+        url: String,
+        headers: Map<String, String>,
+        followRedirects: Boolean = true
+    ): JSONObject {
         val builder = Request.Builder().url(url).get()
         headers.forEach { (name, value) -> builder.header(name, value) }
-        httpClient.newCall(builder.build()).execute().use { response ->
+        val client = if (followRedirects) {
+            httpClient
+        } else {
+            httpClient.newBuilder().followRedirects(false).followSslRedirects(false).build()
+        }
+        client.newCall(builder.build()).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("HTTP ${response.code}")
             }

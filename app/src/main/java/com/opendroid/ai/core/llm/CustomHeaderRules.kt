@@ -68,6 +68,24 @@ object CustomHeaderRules {
     private const val MASKED_VALUE_REASON =
         "looks pasted from the masked display; tap \"Show values\", clear the line, and retype it"
 
+    private const val UNSENDABLE_VALUE_REASON =
+        "contains a character OkHttp cannot send in a header value"
+
+    /**
+     * The only characters OkHttp accepts in a header value: horizontal tab and
+     * printable ASCII. Everything else — control characters, DEL, and non-ASCII such
+     * as `é`, `—`, or a smart quote — makes `Request.Builder.header` throw
+     * `IllegalArgumentException` *while the request is being built*, which reaches the
+     * user as an opaque failure instead of a fixable line.
+     *
+     * `addUnsafeNonAscii` exists but is deliberately not used: RFC 7230 says newly
+     * defined fields SHOULD limit values to US-ASCII, and shipping raw bytes only
+     * works when the server happens to decode them the same way. Refusing the value
+     * with a reason keeps the failure visible and correctable.
+     */
+    private fun Char.isSendableInHeaderValue(): Boolean =
+        this == '\t' || (this in '\u0020'..'\u007e')
+
     private const val MASK_CHAR = '•'
 
     /**
@@ -149,6 +167,9 @@ object CustomHeaderRules {
 
                 value.any(::isMaskingCharacter) ->
                     reject(ignored, reasons, transition, "\"$name\" $MASKED_VALUE_REASON")
+
+                !value.all { it.isSendableInHeaderValue() } ->
+                    reject(ignored, reasons, transition, "\"$name\" $UNSENDABLE_VALUE_REASON")
 
                 isReservedName(name) ->
                     reject(ignored, reasons, transition, "\"$name\" is set by the app and cannot be replaced")
@@ -248,6 +269,7 @@ object CustomHeaderRules {
             transition.value.length <= MAX_VALUE_LENGTH &&
             FORBIDDEN_VALUE_CHARS.none(transition.value::contains) &&
             transition.value.none(::isMaskingCharacter) &&
+            transition.value.all { it.isSendableInHeaderValue() } &&
             !isReservedName(transition.name)
 
     private fun reject(

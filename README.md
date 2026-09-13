@@ -248,11 +248,14 @@ CF-Access-Client-Id: 0123.access
 
 Those headers are sent with chat completions *and* with model-list requests, so the
 model picker works against the same gateway. Blank lines and `#`/`;` comments are
-ignored; a line that cannot be sent (malformed name, missing value, or a header the
-app manages itself, such as `Authorization` or `Content-Type`) is reported under the
-editor rather than dropped silently. Values are masked in Settings until you reveal
-them, the block is stored as a Keystore-encrypted credential rather than in the
-app settings file, and header values are redacted out of provider error messages.
+ignored; a line that cannot be sent — a malformed name, a missing value, a character
+OkHttp cannot transport, or a header the app manages itself such as `Authorization`
+or `Content-Type` — is reported under the editor rather than dropped silently. Values
+are masked in Settings until you reveal them, the block is stored as a
+Keystore-encrypted credential rather than in the app settings file, and redirects from
+the endpoint are refused so a gateway token is never forwarded to another host.
+Header values of 8 or more characters are also redacted out of provider error
+messages; shorter values are not.
 
 ---
 
