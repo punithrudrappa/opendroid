@@ -26,17 +26,25 @@ object UrlUtils {
     /**
      * True when [rawUrl] would be contacted over an unencrypted connection.
      *
-     * Scheme-less input counts, because [formatBaseUrl] is what actually builds the request
-     * URL and it defaults a missing scheme to `http://` — so `192.168.1.5:8080/v1` really does
-     * travel in cleartext. A blank endpoint, and any `https://` endpoint, do not.
+     * Classification runs on the *normalized* URL, not the raw text, because
+     * [formatBaseUrl] is what actually builds the request URL and it both strips
+     * internal whitespace and defaults a missing scheme to `http://`. Checking the raw
+     * text gets this wrong in both directions:
+     *
+     * - `"https: //gateway.example.com/v1"` is sent over https (the space is stripped),
+     *   so warning about it would be a false alarm;
+     * - `"192.168.1.5:8080/v1"` is sent over http (defaulted scheme), so it must warn.
+     *
+     * A blank endpoint returns false: there is nothing to warn about until the user has
+     * configured one.
      *
      * Callers use this to warn before sending credentials (an API key, or a custom-header
      * value) over such a connection.
      */
     fun usesCleartextTransport(rawUrl: String?): Boolean {
-        val trimmed = rawUrl?.trim().orEmpty()
-        if (trimmed.isEmpty()) return false
-        return !trimmed.startsWith("https://", ignoreCase = true)
+        val normalized = formatBaseUrl(rawUrl)
+        if (normalized.isEmpty()) return false
+        return !normalized.startsWith("https://", ignoreCase = true)
     }
 
     private fun normalize(url: String?): String {

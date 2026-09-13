@@ -35,6 +35,28 @@ class UrlUtilsTest {
     }
 
     @Test
+    fun `classification follows the normalized URL, not the raw text`() {
+        // formatBaseUrl strips whitespace mid-string, so this is genuinely sent over
+        // https and must not be flagged as cleartext.
+        assertEquals(
+            "https://gateway.example.com/v1",
+            UrlUtils.formatBaseUrl("https: //gateway.example.com/v1")
+        )
+        assertFalse(UrlUtils.usesCleartextTransport("https: //gateway.example.com/v1"))
+
+        // The inverse direction: no scheme means http, so it must be flagged even though
+        // the raw text says nothing about a scheme.
+        assertEquals("http://192.168.1.5:8080/v1", UrlUtils.formatBaseUrl("192.168.1.5:8080/v1"))
+        assertTrue(UrlUtils.usesCleartextTransport("192.168.1.5:8080/v1"))
+    }
+
+    @Test
+    fun `a trailing slash or surrounding whitespace does not change the classification`() {
+        assertFalse(UrlUtils.usesCleartextTransport("  https://gateway.example.com/v1/  "))
+        assertTrue(UrlUtils.usesCleartextTransport("  http://gateway.example.com/v1/  "))
+    }
+
+    @Test
     fun `an unconfigured endpoint is not reported as cleartext`() {
         assertFalse(UrlUtils.usesCleartextTransport(null))
         assertFalse(UrlUtils.usesCleartextTransport(""))
