@@ -2702,8 +2702,11 @@ private fun CustomHeadersEditor(
         // Masking is a rendering concern (see HeaderValuesVisualTransformation): the
         // field's value stays the real block, so a keystroke can never commit the mask.
         visualTransformation = if (revealValues) VisualTransformation.None else maskedValues,
+        // No maxLines: the field grows with the block. A cap turned a long block
+        // into an auto-scrolling box that showed only its tail, which reads as
+        // "Show values only reveals the last line". The enclosing list is
+        // scrollable, so growth is safe.
         minLines = 3,
-        maxLines = 8,
         colors = OutlinedTextFieldDefaults.colors(
             focusedBorderColor = AccentCyan,
             unfocusedBorderColor = BorderColor,

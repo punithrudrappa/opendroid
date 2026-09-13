@@ -112,4 +112,48 @@ class HeaderValuesVisualTransformationTest {
         assertEquals("X-Gateway-Token: " + "\u2022".repeat(gatewayToken.length), rendered)
         assertTrue(CustomHeaderRules.isMaskingCharacter('\u2022'))
     }
+
+    @Test
+    fun `every line of a longer block is masked, not only the last one`() {
+        // A user reported that revealing values appeared to show only the last line.
+        // The masking was per line all along; the field's height cap is what hid the
+        // rest. This pins the transformation half, so a regression here would show up
+        // as missing lines rather than as a display quirk.
+        val block = listOf(
+            "CF-Access-Client-Id: 0123.access",
+            "CF-Access-Client-Secret: s3cr3t-value-here",
+            "X-Portkey-Config: pc-abc123",
+            "X-Tenant: acme",
+            "X-Trace-Id: 4f2a"
+        ).joinToString("\n")
+
+        val rendered = transformation.filter(AnnotatedString(block)).text.text
+
+        assertEquals(5, rendered.lines().size)
+        assertEquals(block.length, rendered.length)
+        // Every value is masked; every name stays readable.
+        assertEquals(
+            listOf(
+                "CF-Access-Client-Id: " + "•".repeat(11),
+                "CF-Access-Client-Secret: " + "•".repeat(17),
+                "X-Portkey-Config: " + "•".repeat(9),
+                "X-Tenant: " + "•".repeat(4),
+                "X-Trace-Id: " + "•".repeat(4)
+            ),
+            rendered.lines()
+        )
+        assertFalse(rendered.contains("acme"))
+        assertFalse(rendered.contains("pc-abc123"))
+        assertFalse(rendered.contains("4f2a"))
+    }
+
+    @Test
+    fun `a block with blank and trailing lines keeps every line`() {
+        val block = "X-A: one\n\n\nX-B: two\n"
+
+        val rendered = transformation.filter(AnnotatedString(block)).text.text
+
+        // Blank lines survive so the user's formatting is not silently collapsed.
+        assertEquals("X-A: •••\n\n\nX-B: •••\n", rendered)
+    }
 }
