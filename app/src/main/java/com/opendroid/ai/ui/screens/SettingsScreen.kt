@@ -2671,6 +2671,9 @@ private fun CustomHeadersEditor(
     modifier: Modifier = Modifier
 ) {
     var revealValues by remember { mutableStateOf(false) }
+    // Held in `remember`: the field re-reads this on every recomposition, and building
+    // a fresh instance each time would re-mask the block for nothing.
+    val maskedValues = remember { HeaderValuesVisualTransformation() }
 
     Text(
         text = "CUSTOM HEADERS (OPTIONAL)",
@@ -2696,11 +2699,9 @@ private fun CustomHeadersEditor(
             )
         },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-        visualTransformation = if (revealValues) {
-            VisualTransformation.None
-        } else {
-            HeaderValuesVisualTransformation()
-        },
+        // Masking is a rendering concern (see HeaderValuesVisualTransformation): the
+        // field's value stays the real block, so a keystroke can never commit the mask.
+        visualTransformation = if (revealValues) VisualTransformation.None else maskedValues,
         minLines = 3,
         maxLines = 8,
         colors = OutlinedTextFieldDefaults.colors(
