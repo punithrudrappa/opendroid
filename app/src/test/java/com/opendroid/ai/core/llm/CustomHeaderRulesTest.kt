@@ -281,15 +281,20 @@ class CustomHeaderRulesTest {
     }
 
     @Test
-    fun `a masked block still parses back to the same names`() {
+    fun `a masked block still names the same headers without being sendable`() {
         val raw = "X-Tenant: acme\nX-Gateway-Token: gw-0123456789abcdef"
         val masked = CustomHeaderRules.mask(raw)
 
+        // Names survive masking so a user can still tell what is configured...
         assertEquals(
-            CustomHeaderRules.appliedNames(raw),
-            CustomHeaderRules.appliedNames(masked)
+            raw.lines().map { it.substringBefore(':') },
+            masked.lines().map { it.substringBefore(':') }
         )
         assertEquals(listOf("X-Tenant", "X-Gateway-Token"), CustomHeaderRules.appliedNames(raw))
+        // ...and the masked text is deliberately NOT a sendable block, so a value that
+        // escapes the editor as a mask cannot reach the network.
+        assertTrue(CustomHeaderRules.appliedNames(masked).isEmpty())
+        assertFalse(CustomHeaderRules.mask(raw).contains("acme"))
     }
 
     @Test
@@ -306,5 +311,68 @@ class CustomHeaderRulesTest {
 
         assertTrue(parsed.safe.isEmpty())
         assertTrue(parsed.reasons.isEmpty())
+    }
+
+    @Test
+    fun `a value copied out of the masked display is refused instead of sent`() {
+        // The exact failure users hit: the editor once made the mask the value, and
+        // OkHttp rejected the request with "unexpected char 0x2022 in
+        // CF-Access-Client-Id value". A bullet can never be part of a real header
+        // value, so the parse step refuses it and says how to fix it.
+        val parsed = CustomHeaderRules.parse("CF-Access-Client-Id: ••••••••")
+
+        assertTrue(parsed.safe.isEmpty())
+        assertEquals(1, parsed.ignored.size)
+        val reason = parsed.reasons.single()
+        assertTrue(reason.contains("CF-Access-Client-Id"))
+        assertTrue(reason.contains("Show values"))
+        assertTrue(reason.contains("retype"))
+    }
+
+    @Test
+    fun `a masking character anywhere in a value is refused`() {
+        val parsed = CustomHeaderRules.parse("X-Tenant: acme•")
+
+        assertTrue(parsed.safe.isEmpty())
+        assertTrue(parsed.reasons.single().contains("masked display"))
+    }
+
+    @Test
+    fun `invisible paste characters that break a request are refused`() {
+        // OkHttp rejects these with an equally opaque "unexpected char" error, so they
+        // are caught here where the user can be told which line is at fault.
+        val invisible = listOf('\u00a0', '\u200b', '\u200e', '\u200f', '\ufeff')
+        invisible.forEach { character ->
+            val parsed = CustomHeaderRules.parse("X-Tenant: acme${character}tail")
+            assertTrue(
+                "U+%04X must be refused".format(character.code),
+                parsed.safe.isEmpty()
+            )
+            assertTrue(parsed.reasons.single().contains("masked display"))
+        }
+    }
+
+    @Test
+    fun `a masked value is neither sent nor registered as a secret`() {
+        val parsed = CustomHeaderRules.parse("CF-Access-Client-Id: ••••••••")
+
+        // Both transport paths must refuse it, not just the reporting one.
+        assertTrue(CustomHeaderRules.toHeaderMap(parsed.ignored).isEmpty())
+        assertTrue(CustomHeaderRules.secretValues(parsed.ignored).isEmpty())
+        assertTrue(CustomHeaderRules.appliedNames("CF-Access-Client-Id: ••••••••").isEmpty())
+    }
+
+    @Test
+    fun `the masking guard is reported for every line that carries a bullet`() {
+        val parsed = CustomHeaderRules.parse(
+            """
+            X-First: •••
+            X-Second: real-value
+            """.trimIndent()
+        )
+
+        assertEquals(listOf("X-Second"), parsed.safe.map { it.name })
+        assertEquals(1, parsed.reasons.size)
+        assertTrue(parsed.reasons.single().contains("X-First"))
     }
 }

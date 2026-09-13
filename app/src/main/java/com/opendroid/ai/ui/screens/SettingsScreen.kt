@@ -40,8 +40,8 @@ import com.opendroid.ai.data.models.resolvedAutoMode
 import com.opendroid.ai.core.llm.OnDeviceModelRegistry
 import com.opendroid.ai.core.llm.OnDeviceBackend
 import com.opendroid.ai.core.llm.ConnectionTestState
-import com.opendroid.ai.core.llm.CustomHeaderRules
 import com.opendroid.ai.core.llm.error.LLMError
+import com.opendroid.ai.ui.components.HeaderValuesVisualTransformation
 import com.opendroid.ai.core.security.ProviderCredentialRecoveryState
 import com.opendroid.ai.data.repository.ProviderCredentialPersistenceState
 import com.google.mlkit.genai.prompt.*
@@ -2653,14 +2653,15 @@ private fun SecureApiKeyField(
  * `Name: Value` pair per line.
  *
  * Values are masked unless the user opts in to reveal them, because a gateway
- * header often carries a token. Masking is applied to the rendered text only:
- * typing and pasting always operate on the real value, so the caret and the
- * stored string stay correct — the same trade-off `SecureApiKeyField` makes for a
- * single-line secret, extended to a block of lines.
+ * header often carries a token. The mask is a [VisualTransformation] only — the
+ * field's value is always the real block — which is what keeps a keystroke from
+ * turning the bullets into the stored header. Masking the *value* instead is how
+ * this editor first shipped, and it produced header values full of `0x2022`.
  *
  * [warnings] lists lines that are configured but not sent (a reserved name, a
- * malformed name, a missing value). They are shown instead of being dropped
- * silently, so a header that "does nothing" has a visible reason.
+ * malformed name, a missing value, a value copied out of the masked display). They
+ * are shown instead of being dropped silently, so a header that "does nothing" has
+ * a visible reason.
  */
 @Composable
 private fun CustomHeadersEditor(
@@ -2670,7 +2671,6 @@ private fun CustomHeadersEditor(
     modifier: Modifier = Modifier
 ) {
     var revealValues by remember { mutableStateOf(false) }
-    val maskedValue = remember(value) { CustomHeaderRules.mask(value) }
 
     Text(
         text = "CUSTOM HEADERS (OPTIONAL)",
@@ -2681,7 +2681,11 @@ private fun CustomHeadersEditor(
     )
     Spacer(modifier = Modifier.height(8.dp))
     OutlinedTextField(
-        value = if (revealValues) value else maskedValue,
+        // Always the real block. Masking is a rendering concern (see
+        // HeaderValuesVisualTransformation): substituting masked text as the field
+        // value makes the bullets the data on the next keystroke, and the request
+        // then fails with "unexpected char 0x2022".
+        value = value,
         onValueChange = onValueChange,
         label = { Text("One header per line", fontSize = 12.sp) },
         placeholder = {
@@ -2692,7 +2696,11 @@ private fun CustomHeadersEditor(
             )
         },
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-        visualTransformation = VisualTransformation.None,
+        visualTransformation = if (revealValues) {
+            VisualTransformation.None
+        } else {
+            HeaderValuesVisualTransformation()
+        },
         minLines = 3,
         maxLines = 8,
         colors = OutlinedTextFieldDefaults.colors(

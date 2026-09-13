@@ -50,6 +50,24 @@ object CustomHeaderRules {
     /** A value that carries its own line break could inject a second header. */
     private val FORBIDDEN_VALUE_CHARS = charArrayOf('\r', '\n', '\u0000')
 
+    /**
+     * Characters a header value can never legitimately contain here: the masking
+     * bullet plus the invisible characters a copy/paste from a document brings
+     * along. OkHttp rejects them, so a line carrying one would fail the whole
+     * request with an opaque "unexpected char" error instead of a usable message.
+     */
+    private val MASKING_CHARACTERS = setOf(
+        '\u2022', // • U+2022 BULLET, the mask
+        '\u00a0', // non-breaking space
+        '\u200b', // zero-width space
+        '\u200e', // left-to-right mark
+        '\u200f', // right-to-left mark
+        '\ufeff'  // byte-order mark
+    )
+
+    private const val MASKED_VALUE_REASON =
+        "looks pasted from the masked display; tap \"Show values\", clear the line, and retype it"
+
     private const val MASK_CHAR = '•'
 
     /**
@@ -80,6 +98,9 @@ object CustomHeaderRules {
     /** True when [name] is a header the transport or the API key already owns. */
     fun isReservedName(name: String): Boolean =
         name.trim().lowercase() in RESERVED_NAMES
+
+    /** True for characters that are only ever produced by masking a value. */
+    fun isMaskingCharacter(character: Char): Boolean = character in MASKING_CHARACTERS
 
     /**
      * Parses the editor snapshot. `#` and `;` start a comment line, a blank line
@@ -125,6 +146,9 @@ object CustomHeaderRules {
 
                 FORBIDDEN_VALUE_CHARS.any(value::contains) ->
                     reject(ignored, reasons, transition, "\"$name\" value contains a line break")
+
+                value.any(::isMaskingCharacter) ->
+                    reject(ignored, reasons, transition, "\"$name\" $MASKED_VALUE_REASON")
 
                 isReservedName(name) ->
                     reject(ignored, reasons, transition, "\"$name\" is set by the app and cannot be replaced")
@@ -179,8 +203,14 @@ object CustomHeaderRules {
             .map { it.value }
 
     /**
-     * Masked rendering for the UI: names stay readable, values become bullets, so
-     * a pasted gateway token is not shouldersurfable in Settings.
+     * Masked text for a display-only preview: names stay readable, values become
+     * bullets, so a pasted gateway token is not shouldersurfable.
+     *
+     * This is text for *showing*, never text for editing. An earlier version fed
+     * this output back into the header editor as the text field's own value, which
+     * turned the bullets into the stored header value the moment the user typed;
+     * [parse] now also refuses such a value outright, and the editor masks through
+     * `HeaderValuesVisualTransformation` so its value stays the real block.
      */
     fun mask(raw: String): String = raw.split('\n').joinToString("\n") { rawLine ->
         val line = rawLine.trimNameAndValue()
@@ -217,6 +247,7 @@ object CustomHeaderRules {
             transition.value.isNotEmpty() &&
             transition.value.length <= MAX_VALUE_LENGTH &&
             FORBIDDEN_VALUE_CHARS.none(transition.value::contains) &&
+            transition.value.none(::isMaskingCharacter) &&
             !isReservedName(transition.name)
 
     private fun reject(
