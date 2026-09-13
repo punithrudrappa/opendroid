@@ -1559,18 +1559,29 @@ fun SettingsScreen(
                                 fontSize = 10.sp,
                                 color = TextSecondary
                             )
-                            // Cleartext to a LAN host is intended (self-hosted gateways), but the
-                            // request carries both the API key and any custom header value, so the
-                            // exposure is stated rather than left silent. Remote HTTP cannot be
-                            // reached at all: the app's network security config permits cleartext
-                            // only for localhost/127.0.0.1/10.0.2.2.
-                            if (isCleartextEndpoint(config.customEndpoints["Custom OpenAI Compatible"])) {
-                                Spacer(modifier = Modifier.height(6.dp))
-                                Text(
-                                    text = "⚠ Not an https:// endpoint: the API key and any header values are sent unencrypted over this connection. Use https:// outside a trusted local network.",
-                                    fontSize = 10.sp,
-                                    color = Color(0xFFFF9800)
-                                )
+                            // Cleartext to this device is a supported setup (and permitted by the
+                            // app's network security config), but cleartext to any other host is
+                            // refused before a request is built, because the API key and every
+                            // custom-header value would travel in the clear. Naming the reason here
+                            // is what makes that refusal actionable.
+                            when (cleartextEndpointState(config.customEndpoints["Custom OpenAI Compatible"])) {
+                                CleartextEndpointState.REFUSED -> {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text(
+                                        text = "⚠ This endpoint would send the API key and your custom headers over http:// to another host, so requests are refused. Use https://, or point the endpoint at localhost / 127.0.0.1 on this device.",
+                                        fontSize = 10.sp,
+                                        color = Color(0xFFFF9800)
+                                    )
+                                }
+                                CleartextEndpointState.LOCAL -> {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Text(
+                                        text = "ℹ Cleartext http:// to this device. Allowed because the traffic never leaves it; an endpoint reachable over a network needs https://.",
+                                        fontSize = 10.sp,
+                                        color = TextSecondary
+                                    )
+                                }
+                                CleartextEndpointState.NONE -> Unit
                             }
                             Spacer(modifier = Modifier.height(16.dp))
                             CustomHeadersEditor(
@@ -2616,14 +2627,19 @@ private fun connectionStatusLabel(state: ConnectionTestState?): String = when (s
     else -> "Not tested"
 }
 
+/** How a configured custom endpoint's transport is presented in Settings. */
+private enum class CleartextEndpointState { NONE, LOCAL, REFUSED }
+
 /**
- * True when the configured custom endpoint would send credentials unencrypted.
- *
- * Delegates to [UrlUtils] so the rule matches the URL the provider actually builds —
- * notably, a scheme-less host is `http://` there, not `https://`.
+ * Classifies the configured endpoint for the transport warning, using [UrlUtils] so the
+ * verdict matches the URL the provider actually builds — notably, a scheme-less host is
+ * `http://` there, not `https://`.
  */
-private fun isCleartextEndpoint(endpoint: String?): Boolean =
-    UrlUtils.usesCleartextTransport(endpoint)
+private fun cleartextEndpointState(endpoint: String?): CleartextEndpointState = when {
+    !UrlUtils.usesCleartextTransport(endpoint) -> CleartextEndpointState.NONE
+    UrlUtils.allowCleartextTransport(endpoint) -> CleartextEndpointState.LOCAL
+    else -> CleartextEndpointState.REFUSED
+}
 
 @Composable
 private fun formatBytes(bytes: Long): String {

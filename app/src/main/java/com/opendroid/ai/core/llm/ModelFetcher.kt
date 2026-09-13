@@ -164,6 +164,15 @@ class ModelFetcher @Inject constructor(
                         )
                     }
                     val baseUrl = UrlUtils.formatBaseUrl(customUrl, "")
+                    // The same transport rule the completion path applies: this request
+                    // carries the API key and the custom headers too, so a cleartext
+                    // endpoint aimed at another host is refused rather than attempted.
+                    if (!UrlUtils.allowCleartextTransport(baseUrl)) {
+                        return@withContext ModelFetchOutcome.Failed(
+                            "Use an https:// endpoint. Loading models over http:// would send " +
+                                "the API key and your custom headers unencrypted."
+                        )
+                    }
                     // A gateway that needs headers to route a completion needs them
                     // to list models too, or the picker stays empty. Redirects are
                     // refused here because those headers can carry a gateway token.

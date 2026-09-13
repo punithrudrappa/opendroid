@@ -3,6 +3,7 @@ package com.opendroid.ai.core.llm.providers
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.opendroid.ai.core.llm.*
+import com.opendroid.ai.core.llm.error.LLMErrorMapper
 import com.opendroid.ai.core.llm.error.ProviderErrorDetail
 import com.opendroid.ai.core.llm.error.toSafeProviderException
 import com.opendroid.ai.core.util.UrlUtils
@@ -47,6 +48,13 @@ class CustomOpenAIProvider @Inject constructor(
 
         val startTime = System.currentTimeMillis()
         val selectedModel = request.model?.takeIf { it.isNotBlank() } ?: "gpt-4o"
+
+        // Refuse before building the request: sending an API key or a gateway token in
+        // cleartext to another host is not something to attempt and hope about. OkHttp
+        // enforces the same policy at connect time; failing here names the cause.
+        if (!UrlUtils.allowCleartextTransport(baseUrl)) {
+            throw LLMErrorMapper.requestInvalid(name, selectedModel)
+        }
 
         // Build messages payload
         val messagesList = request.messages.toOpenAIMessages(request.systemPrompt)

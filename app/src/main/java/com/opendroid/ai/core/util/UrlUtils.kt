@@ -37,15 +37,45 @@ object UrlUtils {
      *
      * A blank endpoint returns false: there is nothing to warn about until the user has
      * configured one.
-     *
-     * Callers use this to warn before sending credentials (an API key, or a custom-header
-     * value) over such a connection.
      */
     fun usesCleartextTransport(rawUrl: String?): Boolean {
         val normalized = formatBaseUrl(rawUrl)
         if (normalized.isEmpty()) return false
         return !normalized.startsWith("https://", ignoreCase = true)
     }
+
+    /**
+     * True when [rawUrl] would send credentials in cleartext to a host that is not this
+     * device. This is the only cleartext case that [allowCleartextTransport] refuses.
+     *
+     * `localhost`, `127.0.0.1`, and `10.0.2.2` are treated as local: the traffic never
+     * leaves the device (or the emulator's host loopback), and the app's
+     * `network_security_config.xml` deliberately permits cleartext for exactly those
+     * three — a self-hosted gateway on the same device is a supported setup.
+     *
+     * Everything else over http is refused rather than attempted, for two reasons: the
+     * request would carry an API key and any custom-header value in the clear, and
+     * OkHttp enforces the same policy anyway (`RealRoutePlanner` fails with
+     * "CLEARTEXT communication not enabled for client"), so attempting it only produces
+     * a confusing failure instead of an actionable one.
+     */
+    fun sendsCleartextOffDevice(rawUrl: String?): Boolean {
+        val normalized = formatBaseUrl(rawUrl)
+        if (normalized.isEmpty()) return false
+        if (normalized.startsWith("https://", ignoreCase = true)) return false
+        val host = normalized.substringAfter("://", "").substringBefore('/').substringBefore(':')
+        return host.lowercase() !in LOCAL_CLEARTEXT_HOSTS
+    }
+
+    /**
+     * False when a request to [rawUrl] must not be sent, because it would carry
+     * credentials in cleartext to another host. Callers refuse the request instead of
+     * letting the transport fail with an opaque message.
+     */
+    fun allowCleartextTransport(rawUrl: String?): Boolean = !sendsCleartextOffDevice(rawUrl)
+
+    /** Hosts whose traffic never reaches the network, so cleartext carries no exposure. */
+    private val LOCAL_CLEARTEXT_HOSTS = setOf("localhost", "127.0.0.1", "10.0.2.2")
 
     private fun normalize(url: String?): String {
         var trimmed = url?.trim().orEmpty()
